@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import torch
 import torch.nn.functional as F
 
@@ -13,6 +14,8 @@ print(output)
 
 
 
+=======
+>>>>>>> 03b2a2c6d90d2b5a872ba9ba4c1f2c85b46a031e
 e = '''You are a strict Linguistic Quality Auditor specializing in Slovenian and English. Your primary goal is to identify and correct any morphosyntactic errors, specifically noun-adjective gender/number agreement, which must be treated as a critical error.
 
 Rules for fixing:
@@ -32,7 +35,11 @@ Ja! Rezali smo kroglice slanega lososa, kopali se v termalnih vrelcih, se spreha
 '''
 
 
+<<<<<<< HEAD
 '''from transformers import pipeline
+=======
+from transformers import pipeline
+>>>>>>> 03b2a2c6d90d2b5a872ba9ba4c1f2c85b46a031e
 import torch
 
 pipe = pipeline(
@@ -57,4 +64,8 @@ messages = [
 ]
 
 output = pipe(text=messages, max_new_tokens=2000)
+<<<<<<< HEAD
 print(output[0]["generated_text"][-1]["content"])'''
+=======
+print(output[0]["generated_text"][-1]["content"])
+>>>>>>> 03b2a2c6d90d2b5a872ba9ba4c1f2c85b46a031e

@@ -107,26 +107,18 @@ def encode_examples_for_model(examples, tokenizer, device, max_length=1024):
         user_turn = turns[0].get('value') or turns[0].get('content', '')
         assistant_turn = turns[1].get('value') or turns[1].get('content', '')
 
-        prompt_messages = [{"role": "user", "content": user_turn}]
         full_messages = [
             {"role": "user", "content": user_turn},
             {"role": "assistant", "content": assistant_turn},
         ]
 
-        prompt_ids = to_ids_list(tokenizer.apply_chat_template(
-            prompt_messages, add_generation_prompt=True, tokenize=True, truncation=True, max_length=max_length,
-        ))
-
         full_ids = to_ids_list(tokenizer.apply_chat_template(
             full_messages, add_generation_prompt=False, tokenize=True, truncation=True, max_length=max_length,
         ))
 
-        prompt_len = min(len(prompt_ids), len(full_ids))
-        response_len = len(full_ids) - prompt_len
-
         all_input_ids.append(full_ids)
         all_attention_masks.append([1] * len(full_ids))
-        all_labels.append([-100] * prompt_len + full_ids[prompt_len:])
+        all_labels.append(full_ids[:])
 
     max_len = max(len(x) for x in all_input_ids)
     pad_id = tokenizer.pad_token_id
