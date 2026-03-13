@@ -1,3 +1,10 @@
+I have this code for my new meta learning framework. The basic idea is that before model training on the specific example, we ask the model to check the example for errors and fix it if needed. If the fix is good (based on the perpleyity measure and alignment with the validation gradient), we do SFt fine tuning on the corrected example instead of on the original example. Additonally, model gets rewards for finding mistakes, correctly fixing the mistake, correctly classifying the example as CLEAN, etc. During training however I always run into an issue. The model eventually stops fixing examples and converges into this:
+
+[reward error] Bad JSON or parsing fail: Expecting value: line 1 column 1 (char 0)
+Batch 1175 | Loss: 2.0000 | Avg Reward: -2.0000
+
+This is my train script:
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -617,3 +624,15 @@ if __name__ == '__main__':
     print(f"Dataset size after filtering: {len(combined)}")
     random.shuffle(combined)
     train(combined, val_anchor, val_embeddings)
+
+
+I think the problem is task Collision (SFT Objective vs RL Objective) and my model suffers from "Persona Erasure".
+During the RL phase, the model is prompted with: "You are a strict Linguistic Quality Auditor..." and asked to generate raw JSON.
+During the SFT phase (if a fix succeeds), I do sft_encoding = encode_examples_for_model([sft_item], ...) where sft_item is the original conversational dataset item.
+This means within the same backward pass, the SFT loss is actively training the model weights to act like a normal conversational assistant answering user prompts, while the RL loss tries to teach it to be a JSON meta-auditor. The SFT objective tends to dominate, overwriting the model's zero-shot ability to obey the Auditor prompt. This pulls the model back to outputting conversational text during the RL phase.
+To solve this issue, I think I should not have two objectives (SFT and RL) at once. Instead, I was thinking of the following:
+1.) If the fix succeeds, I want to do DPO, where I reinforce the model to be more similar to the correct example and less similar to the incorrect example
+2.) If the fix does not suceed, I skip the example
+3.) If the example is clean, I just do SFT
+Would that work? If yes, can you fix my code to do that?
+
