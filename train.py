@@ -9,9 +9,11 @@ import numpy as np
 from torch.optim import Adam
 import gc
 import os
+import copy
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+# Global stats for normalization
 ppl_stats = {"mean": 0.0, "var": 1.0, "n": 0}
 align_stats = {"mean": 0.0, "var": 1.0, "n": 0}
 
@@ -43,8 +45,7 @@ def compute_gradient_vector(model, batch_encoding, lora_params):
     loss_val = loss.item()
     if not np.isfinite(loss_val):
         model.zero_grad()
-        if not was_training:
-            model.eval()
+        if not was_training: model.eval()
         torch.cuda.empty_cache()
         total_params = sum(p.numel() for p in lora_params)
         return torch.zeros(total_params), loss_val
@@ -58,12 +59,8 @@ def compute_gradient_vector(model, batch_encoding, lora_params):
         grads.append(g)
 
     model.zero_grad()
-    for p in lora_params:
-        p.grad = None
-
-    if not was_training:
-        model.eval()
-
+    for p in lora_params: p.grad = None
+    if not was_training: model.eval()
     torch.cuda.empty_cache()
     return torch.cat(grads), loss_val
 
@@ -72,11 +69,7 @@ def compute_gradient_vector(model, batch_encoding, lora_params):
 
 def retrieve_similar_val_examples(batch_texts, val_examples, val_embeddings, k, embedder):
     batch_embeddings = embedder.encode(batch_texts, convert_to_tensor=True)
-    sims = F.cosine_similarity(
-        batch_embeddings.unsqueeze(1),
-        val_embeddings.unsqueeze(0),
-        dim=-1
-    )
+    sims = F.cosine_similarity(batch_embeddings.unsqueeze(1), val_embeddings.unsqueeze(0), dim=-1)
     topk_indices = sims.topk(k, dim=-1).indices
     unique_indices = torch.unique(topk_indices)
     return [val_examples[i] for i in unique_indices.cpu().tolist()]
@@ -86,16 +79,11 @@ def retrieve_similar_val_examples(batch_texts, val_examples, val_embeddings, k, 
 
 def to_ids_list(result):
     if isinstance(result, list):
-        if len(result) > 0 and isinstance(result[0], int):
-            return result
+        if len(result) > 0 and isinstance(result[0], int): return result
         return result[0]
     if hasattr(result, 'input_ids'):
         ids = result.input_ids
-        if isinstance(ids, list):
-            return ids[0] if isinstance(ids[0], list) else ids
-        return ids[0].tolist()
-    if hasattr(result, 'tolist'):
-        return result.tolist()
+        return ids[0].tolist() if hasattr(ids[0], 'tolist') else ids[0]
     return list(result)
 
 
@@ -107,24 +95,26 @@ def encode_examples_for_model(examples, tokenizer, device, max_length=1024):
         user_turn = turns[0].get('value') or turns[0].get('content', '')
         assistant_turn = turns[1].get('value') or turns[1].get('content', '')
 
-        full_messages = [
-            {"role": "user", "content": user_turn},
-            {"role": "assistant", "content": assistant_turn},
-        ]
+        prompt_messages = [{"role": "user", "content": user_turn}]
+        full_messages = [{"role": "user", "content": user_turn}, {"role": "assistant", "content": assistant_turn}]
 
-        full_ids = to_ids_list(tokenizer.apply_chat_template(
-            full_messages, add_generation_prompt=False, tokenize=True, truncation=True, max_length=max_length,
-        ))
+        prompt_ids = to_ids_list(
+            tokenizer.apply_chat_template(prompt_messages, add_generation_prompt=True, tokenize=True, truncation=True,
+                                          max_length=max_length))
+        full_ids = to_ids_list(
+            tokenizer.apply_chat_template(full_messages, add_generation_prompt=False, tokenize=True, truncation=True,
+                                          max_length=max_length))
+
+        prompt_len = min(len(prompt_ids), len(full_ids))
 
         all_input_ids.append(full_ids)
         all_attention_masks.append([1] * len(full_ids))
-        all_labels.append(full_ids[:])
+        all_labels.append([-100] * prompt_len + full_ids[prompt_len:])
 
     max_len = max(len(x) for x in all_input_ids)
     pad_id = tokenizer.pad_token_id
 
-    def pad_right(seq, pad_val):
-        return seq + [pad_val] * (max_len - len(seq))
+    def pad_right(seq, pad_val): return seq + [pad_val] * (max_len - len(seq))
 
     return {
         "input_ids": torch.tensor([pad_right(x, pad_id) for x in all_input_ids]).to(device),
@@ -134,26 +124,15 @@ def encode_examples_for_model(examples, tokenizer, device, max_length=1024):
 
 
 def make_fixed_conversation(original_item, fixed_assistant_text):
-    import copy
     item = copy.deepcopy(original_item)
     turns = item["conversations"]
     for turn in reversed(turns):
-        key = "value" if "value" in turn else "content"
         role = turn.get("from", turn.get("role", ""))
         if role in ("gpt", "assistant"):
+            key = "value" if "value" in turn else "content"
             turn[key] = fixed_assistant_text
             break
     return item
-
-
-def get_fixed_text_mask(response_ids, fixed_text, tokenizer):
-    fixed_ids = tokenizer.encode(fixed_text, add_special_tokens=False)
-    mask = torch.zeros(len(response_ids), dtype=torch.bool)
-    for start in range(len(response_ids) - len(fixed_ids) + 1):
-        if response_ids[start:start + len(fixed_ids)] == fixed_ids:
-            mask[start:start + len(fixed_ids)] = True
-            break
-    return mask
 
 
 # ── Reward computation ────────────────────────────────────────────────────────
@@ -166,23 +145,22 @@ def compute_perplexity(model, tokenizer, item, device):
     return output.loss.item()
 
 
-def compute_gradient_alignment_rewards(
+def compute_rewards_and_decide_action(
         model, tokenizer, batch_texts, batch_items, responses,
         val_examples, val_embeddings, embedder, device, k=5,
 ):
     lora_params = get_lora_parameters(model)
-
     similar_val = retrieve_similar_val_examples(batch_texts, val_examples, val_embeddings, k, embedder)
     val_encoding = encode_examples_for_model(similar_val, tokenizer, device)
 
     with torch.enable_grad():
         val_grad, _ = compute_gradient_vector(model, val_encoding, lora_params)
-
     del val_encoding
     torch.cuda.empty_cache()
 
-    rewards = []
-    do_sft_flags = []
+    actions = []
+    # actions structure: list of dicts:
+    # {'action': 'SFT'|'DPO'|'SKIP', 'item': orig_item, 'fixed_text': str, 'auditor_response': str}
 
     for i, (resp, orig_text) in enumerate(zip(responses, batch_texts)):
         try:
@@ -191,227 +169,208 @@ def compute_gradient_alignment_rewards(
 
             status = data.get("status", "DIRTY").upper()
             fixed_text = data.get("fixed_text", orig_text)
-            diag = data.get("diagnosis", "N/A")
-            item_id = batch_items[i]['id']
-            old_conversation = batch_items[i]['conversations']
-            fixed_conversation = make_fixed_conversation(batch_items[i], fixed_text)['conversations']
 
-            print("Status:", status)
-            if status != "CLEAN":
-                print('***********************DIRTY*****************')
-                print('Item id', item_id)
-                print("Fixed text:", fixed_text)
-                print('\n\nOriginal text:', orig_text)
-
+            # --- Check Alignment of Original ---
             orig_encoding = encode_examples_for_model([batch_items[i]], tokenizer, device)
             with torch.enable_grad():
                 orig_grad, _ = compute_gradient_vector(model, orig_encoding, lora_params)
             del orig_encoding
-            torch.cuda.empty_cache()
 
-            orig_alignment = F.cosine_similarity(
-                orig_grad.unsqueeze(0), val_grad.unsqueeze(0)
-            ).item()
+            orig_alignment = F.cosine_similarity(orig_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
+            del orig_grad
 
             if status == "CLEAN":
-                # HIERARCHY RULE 3: Doesn't recognize mistake
-                # Adjust threshold (e.g., 0.1) based on your specific alignment baseline
+                # If model thinks it's clean, but alignment is terrible, it might be wrong.
                 if orig_alignment < 0.1:
-                    reward_val = -2.0
-                    do_sft = False  # Skip SFT, model incorrectly bypassed bad text
-                    print(f"False CLEAN (missed mistake). Reward: {reward_val}")
+                    print(f"False CLEAN. Skipping.")
+                    actions.append({'action': 'SKIP'})
                 else:
-                    # Model correctly identified already-clean text
-                    reward_val = 1.0
-                    do_sft = True
-                    print(f"True CLEAN. Reward: {reward_val}")
-
+                    print(f"True CLEAN. Align: {orig_alignment:.3f}")
+                    actions.append({
+                        'action': 'SFT_CLEAN',
+                        'item': batch_items[i],
+                        'auditor_response': resp  # Keep this for Auditor SFT
+                    })
             else:
-                fixed_encoding = encode_examples_for_model([make_fixed_conversation(batch_items[i], fixed_text)],
-                                                           tokenizer, device)
+                # --- Dirty: Evaluate Fix ---
+                fixed_item = make_fixed_conversation(batch_items[i], fixed_text)
+                fixed_encoding = encode_examples_for_model([fixed_item], tokenizer, device)
                 with torch.enable_grad():
                     fixed_grad, _ = compute_gradient_vector(model, fixed_encoding, lora_params)
                 del fixed_encoding
-                torch.cuda.empty_cache()
 
-                fixed_alignment = F.cosine_similarity(
-                    fixed_grad.unsqueeze(0), val_grad.unsqueeze(0)
-                ).item()
+                fixed_alignment = F.cosine_similarity(fixed_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
                 del fixed_grad
 
+                # Check Faithfulness (Semantic Similarity)
                 with torch.no_grad():
                     orig_emb = embedder.encode(orig_text, convert_to_tensor=True).cpu()
                     fixed_emb = embedder.encode(fixed_text, convert_to_tensor=True).cpu()
                     semantic_sim = F.cosine_similarity(orig_emb.unsqueeze(0), fixed_emb.unsqueeze(0)).item()
 
                 faithfulness_gate = 1.0 if semantic_sim > 0.8 else 0.1
-                alignment_delta = fixed_alignment - orig_alignment
-                alignment_norm = update_and_normalize(alignment_delta, align_stats)
+
+                # Check PPL improvement
                 orig_ppl = compute_perplexity(model, tokenizer, batch_items[i], device)
-                fixed_ppl = compute_perplexity(model, tokenizer, make_fixed_conversation(batch_items[i], fixed_text),
-                                               device)
-                ppl_delta = orig_ppl - fixed_ppl
-                ppl_norm = update_and_normalize(ppl_delta, ppl_stats)
+                fixed_ppl = compute_perplexity(model, tokenizer, fixed_item, device)
 
-                print('Alignment delta', alignment_norm)
-                print('Faithfulnes gate', faithfulness_gate)
-                print('Perplexity delta', ppl_norm)
+                # Composite Score
+                alignment_delta = update_and_normalize(fixed_alignment - orig_alignment, align_stats)
+                ppl_delta = update_and_normalize(orig_ppl - fixed_ppl,
+                                                 ppl_stats)  # higher orig ppl (bad) - lower fixed ppl (good) = positive
 
-                improvement_score = float(0.5 * alignment_norm + 0.5 * ppl_norm)
+                score = 0.5 * alignment_delta + 0.5 * ppl_delta
 
-                if improvement_score > 0 and faithfulness_gate == 1.0:
-                    # HIERARCHY RULE 1: Correctly fixed
-                    reward_val = 2.0
-                    do_sft = True
-                    print(f"Successful FIX! Reward: {reward_val}")
+                print(f"Fix Score: {score:.3f} | Faithful: {semantic_sim:.2f}")
+
+                if score > 0 and faithfulness_gate == 1.0:
+                    print("Successful FIX! Scheduling DPO.")
+                    actions.append({
+                        'action': 'DPO_FIX',
+                        'item': batch_items[i],
+                        'fixed_text': fixed_text,
+                        'auditor_response': resp
+                    })
                 else:
-                    # HIERARCHY RULE 2: Tried but failed to fix correctly
-                    reward_val = 0.5
-                    do_sft = False  # Model should NOT do SFT fine-tuning on it
-                    print(f"Failed FIX. Reward: {reward_val}")
-
-                log_refined_data(item_id, status, diag, fixed_conversation, old_conversation, do_sft)
-
-            del orig_grad
-            torch.cuda.empty_cache()
+                    print("Failed FIX. Skipping.")
+                    actions.append({'action': 'SKIP'})
 
         except Exception as e:
-            print(f"[reward error] Bad JSON or parsing fail: {e}")
-            reward_val = -2.0  # Penalize bad JSON heavily
-            do_sft = False
-
-        rewards.append(torch.tensor(reward_val, dtype=torch.float32))
-        do_sft_flags.append(do_sft)
+            print(f"JSON Error: {e}")
+            actions.append({'action': 'SKIP'})
 
     del val_grad
     torch.cuda.empty_cache()
-    return rewards, do_sft_flags
+    return actions
 
 
-# ── PPO update ────────────────────────────────────────────────────────────────
+# ── Optimization Step (DPO + SFT) ─────────────────────────────────────────────
 
-def ppo_step(model, query_tensors, response_tensors, rewards, statuses,
-             batch_items, parsed_responses, optimizer, do_sft_flags,
-             old_log_probs=None, clip_epsilon=0.2, sft_weight=0.5):
+def get_batch_logps(logits, labels, label_pad_token_id=-100):
+    """Compute log probabilities for DPO"""
+    if logits.shape[:-1] != labels.shape:
+        raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
+
+    labels = labels[:, 1:].clone()
+    logits = logits[:, :-1, :]
+    loss_mask = labels != label_pad_token_id
+
+    # dummy token; we'll zero out loss later
+    labels[labels == label_pad_token_id] = 0
+
+    per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+    return (per_token_logps * loss_mask).sum(-1)
+
+
+def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, beta=0.1):
+    """
+    Handles:
+    1. SFT on Auditor Output (To keep model speaking JSON)
+    2. SFT on Clean Conversation
+    3. DPO on Fixed vs Original Conversation
+    """
     model.train()
-    rewards_tensor = torch.stack(rewards).to(device)
+    total_loss = torch.tensor(0.0, device=device)
+    valid_batch = False
 
-    if rewards_tensor.numel() > 1:
-        std = rewards_tensor.std()
-        if std.item() > 1e-6:
-            rewards_tensor = (rewards_tensor - rewards_tensor.mean()) / (std + 1e-8)
-        else:
-            rewards_tensor = rewards_tensor - rewards_tensor.mean()
+    for action_data, prompt_text in zip(actions, prompts):
+        action_type = action_data['action']
 
-    losses = []
-
-    for i, (query, response, reward, status, item, parsed, do_sft) in enumerate(
-            zip(query_tensors, response_tensors, rewards_tensor, statuses, batch_items, parsed_responses, do_sft_flags)
-    ):
-        # ── 1. SFT target ─────────────────────────────────────────────────────
-        if do_sft:
-            fixed_text = parsed.get("fixed_text", "") if parsed else ""
-            if status == "DIRTY" and fixed_text:
-                sft_item = make_fixed_conversation(item, fixed_text)
-            else:
-                sft_item = item
-
-            sft_encoding = encode_examples_for_model([sft_item], tokenizer, device)
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                sft_output = model(**sft_encoding)
-
-            if not torch.isfinite(sft_output.loss):
-                loss_sft = torch.tensor(0.0, device=device, requires_grad=False)
-            else:
-                loss_sft = sft_output.loss
-            del sft_output, sft_encoding
-            torch.cuda.empty_cache()
-        else:
-            loss_sft = torch.tensor(0.0, device=device, requires_grad=False)
-
-        # ── 2. RL signal ──────────────────────────────────────────────────────
-        input_ids = torch.cat([query, response]).unsqueeze(0).to(device)
-        labels = input_ids.clone()
-        labels[0, :len(query)] = -100
-
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            rl_output = model(
-                input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
-            )
-
-        if not torch.isfinite(rl_output.logits).all():
-            del rl_output
-            losses.append(sft_weight * loss_sft)
+        if action_type == 'SKIP':
             continue
 
-        logits = rl_output.logits[0]
-        target = input_ids[0]
-        response_mask = (labels[0] != -100)
-        del rl_output
+        valid_batch = True
 
-        shift_logits = logits[:-1]
-        shift_targets = target[1:]
+        # ── 1. AUDITOR MAINTENANCE (Crucial for preventing JSON collapse) ──
+        # We SFT on the prompt + the VALID auditor response (JSON)
+        auditor_resp = action_data.get('auditor_response', '')
+        if auditor_resp:
+            auditor_text = prompt_text + auditor_resp
+            # Basic tokenization for SFT
+            auditor_enc = tokenizer(auditor_text, return_tensors='pt', truncation=True, max_length=1024).to(device)
+            # Mask the prompt part for loss
+            prompt_enc = tokenizer(prompt_text, return_tensors='pt', add_special_tokens=False)
+            labels = auditor_enc.input_ids.clone()
+            labels[:, :prompt_enc.input_ids.shape[1]] = -100
 
-        fixed_text = parsed.get("fixed_text", "") if parsed else ""
-        if status == "DIRTY" and fixed_text:
-            ft_mask_response = get_fixed_text_mask(response.tolist(), fixed_text, tokenizer)
-            if not ft_mask_response.any():
-                ft_mask_response = torch.ones(len(response), dtype=torch.bool)
-        else:
-            ft_mask_response = torch.ones(len(response), dtype=torch.bool)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                auditor_out = model(input_ids=auditor_enc.input_ids, attention_mask=auditor_enc.attention_mask,
+                                    labels=labels)
 
-        ft_mask_full = torch.cat([
-            torch.zeros(len(query), dtype=torch.bool),
-            ft_mask_response,
-        ]).to(device)
+            # Weighted less so it doesn't dominate, but keeps the JSON format alive
+            total_loss += 0.5 * auditor_out.loss
+            del auditor_enc, auditor_out
 
-        shift_mask = (ft_mask_full[1:] & response_mask[1:])
-        if not shift_mask.any():
-            shift_mask = response_mask[1:]
+        # ── 2. CONVERSATIONAL OPTIMIZATION ──
 
-        token_log_probs = -F.cross_entropy(shift_logits, shift_targets, reduction="none")
-        denom = shift_mask.float().sum().clamp(min=1)
-        log_prob = (token_log_probs * shift_mask.float()).sum() / denom
+        if action_type == 'SFT_CLEAN':
+            # Standard SFT on the conversation
+            item = action_data['item']
+            sft_encoding = encode_examples_for_model([item], tokenizer, device)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                sft_out = model(**sft_encoding)
+            total_loss += sft_out.loss
+            del sft_encoding, sft_out
 
-        # =====================================================================
-        # FIX: We now use the PPO Detached Ratio trick for all steps.
-        # This keeps the exact same backprop gradients, but visually formats
-        # the loss so that a negative reward = positive loss.
-        # =====================================================================
-        if old_log_probs is not None:
-            ratio = torch.exp(log_prob - old_log_probs[i].detach())
-            clipped = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
-            loss_rl = -torch.min(ratio * reward, clipped * reward)
-        else:
-            ratio = torch.exp(log_prob - log_prob.detach())
-            loss_rl = -ratio * reward
+        elif action_type == 'DPO_FIX':
+            # DPO: Chosen (Fixed) vs Rejected (Original)
+            item = action_data['item']
+            fixed_text = action_data['fixed_text']
 
-        losses.append(loss_rl + sft_weight * loss_sft)
+            item_fixed = make_fixed_conversation(item, fixed_text)
 
-    total_loss = torch.stack(losses).mean()
+            # Prepare inputs
+            enc_chosen = encode_examples_for_model([item_fixed], tokenizer, device)
+            enc_rejected = encode_examples_for_model([item], tokenizer, device)
 
+            # Get Policy Logprobs
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out_chosen = model(**enc_chosen)
+                out_rejected = model(**enc_rejected)
 
-    optimizer.zero_grad()
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(get_lora_parameters(model), max_norm=1.0)
-    optimizer.step()
+            logps_chosen = get_batch_logps(out_chosen.logits, enc_chosen['labels'])
+            logps_rejected = get_batch_logps(out_rejected.logits, enc_rejected['labels'])
 
-    return total_loss.item()
+            # Get Reference Logprobs (Using disabled adapters to act as Ref model)
+            with torch.no_grad():
+                with model.disable_adapter():
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        ref_out_chosen = model(**enc_chosen)
+                        ref_out_rejected = model(**enc_rejected)
+
+            ref_logps_chosen = get_batch_logps(ref_out_chosen.logits, enc_chosen['labels'])
+            ref_logps_rejected = get_batch_logps(ref_out_rejected.logits, enc_rejected['labels'])
+
+            # DPO Loss Calculation
+            pi_logratios = logps_chosen - logps_rejected
+            ref_logratios = ref_logps_chosen - ref_logps_rejected
+
+            logits = pi_logratios - ref_logratios
+            dpo_loss = -F.logsigmoid(beta * logits).mean()
+
+            total_loss += dpo_loss
+
+            del enc_chosen, enc_rejected, out_chosen, out_rejected
+
+    if valid_batch:
+        optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(get_lora_parameters(model), max_norm=1.0)
+        optimizer.step()
+        return total_loss.item()
+    else:
+        return 0.0
 
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
 def generate_responses(model, tokenizer, prompts, device, max_new_tokens=1024):
     model.eval()
-    query_tensors, response_tensors, responses = [], [], []
-
+    responses = []
     with torch.no_grad():
         for prompt in prompts:
-            encoding = tokenizer(
-                prompt, return_tensors="pt", return_attention_mask=True, max_length=1024, add_special_tokens=False
-            ).to(device)
-
+            encoding = tokenizer(prompt, return_tensors="pt", return_attention_mask=True, max_length=1024,
+                                 add_special_tokens=False).to(device)
             output = model.generate(
                 input_ids=encoding.input_ids,
                 attention_mask=encoding.attention_mask,
@@ -420,115 +379,56 @@ def generate_responses(model, tokenizer, prompts, device, max_new_tokens=1024):
                 temperature=0.7,
                 pad_token_id=tokenizer.pad_token_id,
             )
-            response = output[0][encoding.input_ids.shape[1]:]
-            query_tensors.append(encoding.input_ids[0].cpu())
-            response_tensors.append(response.cpu())
-            responses.append(tokenizer.decode(response, skip_special_tokens=True))
-
+            resp_ids = output[0][encoding.input_ids.shape[1]:]
+            responses.append(tokenizer.decode(resp_ids, skip_special_tokens=True))
             del output, encoding
-            torch.cuda.empty_cache()
-
     model.train()
-    return query_tensors, response_tensors, responses
+    return responses
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train(dataset, val_examples, val_embeddings):
-    old_log_probs = None
+    print("Starting Hybrid SFT/DPO Training...")
 
     for i in range(0, len(dataset), batch_size):
         batch = dataset[i: i + batch_size]
+        raw_texts = [item["conversations"][1].get("value", item["conversations"][1].get("content", "")) for item in
+                     batch]
 
-        # def format_conversation(item):
-        #     parts = []
-        #     for turn in item["conversations"]:
-        #         role = turn.get("from", turn.get("role", "turn"))
-        #         text = turn.get("value", turn.get("content", ""))
-        #         parts.append(f"{role}: {text}")
-        #     return "\n".join(parts)
-        #
-        # raw_conversations = [format_conversation(item) for item in batch]
-        raw_texts = [item["conversations"][1].get("value", item["conversations"][1].get("content", ""))
-                     for item in batch]
-
+        # Auditor Prompt
         prompts = []
         for conv in raw_texts:
             messages = [{
                 "role": "user",
                 "content": (
-                    f'''You are a strict Linguistic Quality Auditor specializing in Slovenian and English. Your primary goal is to identify and correct any morphosyntactic errors, specifically noun-adjective gender/number agreement, which must be treated as a critical error.
-
-                    Rules for fixing:
-                    - Perform a deep grammatical scan. You must correct errors in gender (masculine/feminine/neuter) and case agreement immediately.
-                    - Do NOT ignore errors for the sake of 'minimal editing'; if it is grammatically incorrect, it is DIRTY.
-                    - Preserve the meaning, but ensure the grammar is 100% textbook-accurate.
-                    - If the text is English, fix in English. If Slovenian, fix in Slovenian.
-                    - If the text is code-switched or in another language, translate/rewrite fully to Slovenian.
-
-                    Decision Logic:
-                    1. If the text is perfectly grammatical, return: {{"status": "CLEAN"}}
-                    2. If there is even one minor agreement error, return: {{"status": "DIRTY", "fixed_text": "...", "diagnosis": "..."}}
-
-                    Return raw JSON only, no markdown, no explanation outside the JSON.
+                    f'''Your primary goal is to identify and correct any morphosyntactic errors, specifically noun-adjective gender/number agreement, which must be treated as a critical error.
+                    Rules:
+                    1. If grammatical errors exist, return {{"status": "DIRTY", "fixed_text": "...", "diagnosis": "..."}}
+                    2. If perfect, return {{"status": "CLEAN"}}
+                    3. Return ONLY valid JSON.
                     Text: \n "{conv}"'''
                 ),
             }]
-            prompt = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False,
-            )
-            prompts.append(prompt)
+            prompts.append(tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False))
 
-        query_tensors, response_tensors, responses = generate_responses(
-            model, tokenizer, prompts, device
+        # 1. Generate Auditor Feedback
+        responses = generate_responses(model, tokenizer, prompts, device)
+
+        # 2. Decide what to do (SFT Clean, DPO Fix, or Skip)
+        actions = compute_rewards_and_decide_action(
+            model=model, tokenizer=tokenizer,
+            batch_texts=raw_texts, batch_items=batch, responses=responses,
+            val_examples=val_examples, val_embeddings=val_embeddings, embedder=embedder,
+            device=device, k=5
         )
 
-        rewards, do_sft_flags = compute_gradient_alignment_rewards(
-            model=model,
-            tokenizer=tokenizer,
-            batch_texts=raw_texts,
-            batch_items=batch,
-            responses=responses,
-            val_examples=val_examples,
-            val_embeddings=val_embeddings,
-            embedder=embedder,
-            device=device,
-            k=5,
-        )
+        # 3. Update Model
+        loss = hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device)
 
-        statuses = []
-        parsed_responses = []
-        for resp in responses:
-            try:
-                cleaned = resp.replace("```json", "").replace("```", "").strip()
-                data = json.loads(cleaned)
-                statuses.append(data.get("status", "DIRTY").upper())
-                parsed_responses.append(data)
-            except Exception:
-                statuses.append("DIRTY")
-                parsed_responses.append(None)
-
-        loss = ppo_step(
-            model, query_tensors, response_tensors, rewards, statuses,
-            batch, parsed_responses, optimizer, do_sft_flags,
-            old_log_probs=old_log_probs,
-        )
-
-        avg_reward = sum(r.item() for r in rewards) / len(rewards)
-
-        if not np.isfinite(loss):
-            print(
-                f"[WARNING] NaN/Inf loss detected at batch {i // batch_size} — skipping optimizer step and continuing")
-            optimizer.zero_grad()
-            gc.collect()
-            torch.cuda.empty_cache()
-            continue
-
-        print(f"Batch {i // batch_size} | Loss: {loss:.4f} | Avg Reward: {avg_reward:.4f}")
-
+        print(f"Batch {i // batch_size} | Loss: {loss:.4f}")
         gc.collect()
         torch.cuda.empty_cache()
-
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────
 
@@ -559,26 +459,24 @@ def log_refined_data(original_id, status, diagnosis, fixed_text, old_text, corre
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    # ... (Keep your existing initialization code: Model loading, LoRA config, Dataset loading) ...
+    # This part remains exactly the same as your original script
     model_id = "google/gemma-3-12b-it"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size = 1
     SAVE_PATH = "data/refined_nemotron_dataset.jsonl"
 
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
+        load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        quantization_config=bnb_config,
-        device_map="auto",
-        attn_implementation="flash_attention_2"
+        model_id, quantization_config=bnb_config, device_map="auto", attn_implementation="flash_attention_2"
     )
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
@@ -590,22 +488,17 @@ if __name__ == '__main__':
     model = get_peft_model(model, lora_config)
     optimizer = Adam(get_lora_parameters(model), lr=1e-5)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-
     embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
+    # Mock data loading for context (Replace with your actual loaders)
     manual_data = load_jsonl("data/gams_ft_dataset.json")
     silver_data = load_jsonl("data/nemotron_sft_all_final_98k.json")
-
-    val_anchor = manual_data[:1000]
-    train_manual = manual_data[1000:]
-
-    print("Pre-computing validation embeddings...")
+    val_anchor = manual_data[:100]  # reduced for test
+    train_manual = manual_data[100:]
     val_texts = [ex['conversations'][1]['value'] for ex in val_anchor]
     val_embeddings = embedder.encode(val_texts, convert_to_tensor=True)
-    print(f"Val embeddings shape: {val_embeddings.shape}")
-
     combined = silver_data + train_manual
     combined = [item for item in combined if is_short_enough(item, tokenizer)]
-    print(f"Dataset size after filtering: {len(combined)}")
     random.shuffle(combined)
+
     train(combined, val_anchor, val_embeddings)
