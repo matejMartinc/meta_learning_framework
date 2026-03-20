@@ -78,12 +78,27 @@ def retrieve_similar_val_examples(batch_texts, val_examples, val_embeddings, k, 
 # ── Tokenisation helpers ──────────────────────────────────────────────────────
 
 def to_ids_list(result):
+    # Scalar int (single token)
+    if isinstance(result, int):
+        return [result]
+    # Already a flat list of ints
     if isinstance(result, list):
-        if len(result) > 0 and isinstance(result[0], int): return result
-        return result[0]
+        if len(result) > 0 and isinstance(result[0], int):
+            return result
+        # Nested list — unwrap one level
+        if len(result) > 0 and isinstance(result[0], list):
+            return result[0]
+        return result
+    # HuggingFace BatchEncoding or similar
     if hasattr(result, 'input_ids'):
         ids = result.input_ids
-        return ids[0].tolist() if hasattr(ids[0], 'tolist') else ids[0]
+        if hasattr(ids, 'tolist'):
+            return ids[0].tolist() if ids.dim() > 1 else ids.tolist()
+        return list(ids[0]) if hasattr(ids[0], '__iter__') else list(ids)
+    # Tensor
+    if hasattr(result, 'tolist'):
+        t = result.tolist()
+        return t[0] if isinstance(t, list) and len(t) > 0 and isinstance(t[0], list) else t
     return list(result)
 
 
@@ -98,12 +113,12 @@ def encode_examples_for_model(examples, tokenizer, device, max_length=1024):
         prompt_messages = [{"role": "user", "content": user_turn}]
         full_messages = [{"role": "user", "content": user_turn}, {"role": "assistant", "content": assistant_turn}]
 
-        prompt_ids = to_ids_list(
-            tokenizer.apply_chat_template(prompt_messages, add_generation_prompt=True, tokenize=True, truncation=True,
-                                          max_length=max_length))
-        full_ids = to_ids_list(
-            tokenizer.apply_chat_template(full_messages, add_generation_prompt=False, tokenize=True, truncation=True,
-                                          max_length=max_length))
+        prompt_ids = to_ids_list(tokenizer.apply_chat_template(
+            prompt_messages, add_generation_prompt=True, tokenize=True, truncation=True, max_length=max_length
+        ))
+        full_ids = to_ids_list(tokenizer.apply_chat_template(
+            full_messages, add_generation_prompt=False, tokenize=True, truncation=True, max_length=max_length
+        ))
 
         prompt_len = min(len(prompt_ids), len(full_ids))
 
@@ -112,14 +127,17 @@ def encode_examples_for_model(examples, tokenizer, device, max_length=1024):
         all_labels.append([-100] * prompt_len + full_ids[prompt_len:])
 
     max_len = max(len(x) for x in all_input_ids)
-    pad_id = tokenizer.pad_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     def pad_right(seq, pad_val): return seq + [pad_val] * (max_len - len(seq))
 
+    input_ids = torch.tensor([pad_right(x, pad_id) for x in all_input_ids]).to(device)
+
     return {
-        "input_ids": torch.tensor([pad_right(x, pad_id) for x in all_input_ids]).to(device),
+        "input_ids": input_ids,
         "attention_mask": torch.tensor([pad_right(x, 0) for x in all_attention_masks]).to(device),
         "labels": torch.tensor([pad_right(x, -100) for x in all_labels]).to(device),
+        "token_type_ids": torch.zeros_like(input_ids).to(device)
     }
 
 
@@ -169,6 +187,18 @@ def compute_rewards_and_decide_action(
 
             status = data.get("status", "DIRTY").upper()
             fixed_text = data.get("fixed_text", orig_text)
+            diag = data.get("diagnosis", "N/A")
+            item_id = batch_items[i]['id']
+            old_conversation = batch_items[i]['conversations']
+            fixed_conversation = make_fixed_conversation(batch_items[i], fixed_text)['conversations']
+            print("Status:", status)
+
+            if status != "CLEAN":
+                print('***********************DIRTY*****************')
+                print('Item id', item_id)
+                print("Fixed text:", fixed_text)
+                print('\n\nOriginal text:', orig_text)
+
 
             # --- Check Alignment of Original ---
             orig_encoding = encode_examples_for_model([batch_items[i]], tokenizer, device)
@@ -180,17 +210,11 @@ def compute_rewards_and_decide_action(
             del orig_grad
 
             if status == "CLEAN":
-                # If model thinks it's clean, but alignment is terrible, it might be wrong.
-                if orig_alignment < 0.1:
-                    print(f"False CLEAN. Skipping.")
-                    actions.append({'action': 'SKIP'})
-                else:
-                    print(f"True CLEAN. Align: {orig_alignment:.3f}")
-                    actions.append({
-                        'action': 'SFT_CLEAN',
-                        'item': batch_items[i],
-                        'auditor_response': resp  # Keep this for Auditor SFT
-                    })
+                actions.append({
+                    'action': 'SFT_CLEAN',
+                    'item': batch_items[i],
+                    'auditor_response': resp
+                })
             else:
                 # --- Dirty: Evaluate Fix ---
                 fixed_item = make_fixed_conversation(batch_items[i], fixed_text)
@@ -222,8 +246,9 @@ def compute_rewards_and_decide_action(
                 score = 0.5 * alignment_delta + 0.5 * ppl_delta
 
                 print(f"Fix Score: {score:.3f} | Faithful: {semantic_sim:.2f}")
-
+                fix_worked = False
                 if score > 0 and faithfulness_gate == 1.0:
+                    fix_worked = True
                     print("Successful FIX! Scheduling DPO.")
                     actions.append({
                         'action': 'DPO_FIX',
@@ -234,6 +259,8 @@ def compute_rewards_and_decide_action(
                 else:
                     print("Failed FIX. Skipping.")
                     actions.append({'action': 'SKIP'})
+
+                log_refined_data(item_id, status, diag, fixed_conversation, old_conversation, fix_worked)
 
         except Exception as e:
             print(f"JSON Error: {e}")
@@ -260,6 +287,7 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
 
     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
     return (per_token_logps * loss_mask).sum(-1)
+
 
 
 def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, beta=0.1):
@@ -292,17 +320,20 @@ def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, bet
             prompt_enc = tokenizer(prompt_text, return_tensors='pt', add_special_tokens=False)
             labels = auditor_enc.input_ids.clone()
             labels[:, :prompt_enc.input_ids.shape[1]] = -100
+            # Ensure token_type_ids is present if the tokenizer didn't automatically generate it
+            if "token_type_ids" not in auditor_enc:
+                auditor_enc["token_type_ids"] = torch.zeros_like(auditor_enc.input_ids)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                auditor_out = model(input_ids=auditor_enc.input_ids, attention_mask=auditor_enc.attention_mask,
-                                    labels=labels)
+                auditor_out = model(**auditor_enc, labels=labels)
 
             # Weighted less so it doesn't dominate, but keeps the JSON format alive
-            total_loss += 0.5 * auditor_out.loss
+            total_loss += 0.8 * auditor_out.loss
+            if action_type == 'SFT_AUDITOR_ONLY':
+                print("Auditor response:", auditor_resp, "Total loss", total_loss)
             del auditor_enc, auditor_out
 
         # ── 2. CONVERSATIONAL OPTIMIZATION ──
-
         if action_type == 'SFT_CLEAN':
             # Standard SFT on the conversation
             item = action_data['item']
@@ -361,7 +392,6 @@ def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, bet
     else:
         return 0.0
 
-
 # ── Generation ────────────────────────────────────────────────────────────────
 
 def generate_responses(model, tokenizer, prompts, device, max_new_tokens=1024):
@@ -402,11 +432,12 @@ def train(dataset, val_examples, val_embeddings):
             messages = [{
                 "role": "user",
                 "content": (
-                    f'''Your primary goal is to identify and correct any morphosyntactic errors, specifically noun-adjective gender/number agreement, which must be treated as a critical error.
+                    f'''Your primary goal is to audit Slovenian text and identify and correct all morphosyntactic errors, specifically noun-adjective gender/number agreement and wrong case endings, which must be treated as critical errors.
                     Rules:
-                    1. If grammatical errors exist, return {{"status": "DIRTY", "fixed_text": "...", "diagnosis": "..."}}
-                    2. If perfect, return {{"status": "CLEAN"}}
-                    3. Return ONLY valid JSON.
+                    1. Reasoning: Briefly describe any errors found.
+                    2. If grammatical errors exist, return {{"status": "DIRTY", "fixed_text": "...", "diagnosis": "..."}}
+                    3. If perfect, return {{"status": "CLEAN"}}
+                    4. Return ONLY valid JSON.
                     Text: \n "{conv}"'''
                 ),
             }]
