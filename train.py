@@ -163,6 +163,80 @@ def compute_perplexity(model, tokenizer, item, device):
     return output.loss.item()
 
 
+def compute_quality_score(
+        model, tokenizer, batch_items, orig_text, fixed_text,
+        val_grad, lora_params, embedder, device
+):
+    """
+    Compute a continuous quality score in (-1, 1) where:
+        positive  → fix is BETTER than original
+        negative  → fix is WORSE than original (or unfaithful)
+
+    Components
+    ----------
+    alignment_delta : cosine-sim of fix gradient to val gradient minus that of original
+    ppl_delta       : perplexity improvement (orig_ppl - fixed_ppl), normalised
+    faithfulness    : semantic similarity between original and fixed text (gate)
+
+    Returns
+    -------
+    score       : float in (-1, 1)
+    components  : dict for logging
+    """
+    # --- Faithfulness gate (semantic similarity) ---
+    with torch.no_grad():
+        orig_emb = embedder.encode(orig_text, convert_to_tensor=True).cpu()
+        fixed_emb = embedder.encode(fixed_text, convert_to_tensor=True).cpu()
+        semantic_sim = F.cosine_similarity(orig_emb.unsqueeze(0), fixed_emb.unsqueeze(0)).item()
+
+    # Hard gate: if the fix drifts too far from the original meaning, score is negative
+    if semantic_sim < 0.80:
+        return -1.0 * (1.0 - semantic_sim), {
+            "alignment_delta": 0.0, "ppl_delta": 0.0,
+            "semantic_sim": semantic_sim, "faithfulness_penalty": True
+        }
+
+    # --- Gradient alignment delta ---
+    orig_item = batch_items
+    fixed_item = make_fixed_conversation(batch_items, fixed_text)
+
+    orig_encoding = encode_examples_for_model([orig_item], tokenizer, device)
+    with torch.enable_grad():
+        orig_grad, _ = compute_gradient_vector(model, orig_encoding, lora_params)
+    del orig_encoding
+
+    fixed_encoding = encode_examples_for_model([fixed_item], tokenizer, device)
+    with torch.enable_grad():
+        fixed_grad, _ = compute_gradient_vector(model, fixed_encoding, lora_params)
+    del fixed_encoding
+
+    orig_alignment = F.cosine_similarity(orig_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
+    fixed_alignment = F.cosine_similarity(fixed_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
+    del orig_grad, fixed_grad
+    torch.cuda.empty_cache()
+
+    # --- Perplexity delta ---
+    orig_ppl = compute_perplexity(model, tokenizer, orig_item, device)
+    fixed_ppl = compute_perplexity(model, tokenizer, fixed_item, device)
+
+    # Normalise both deltas through running stats → tanh squash → (-1, 1)
+    norm_align = update_and_normalize(fixed_alignment - orig_alignment, align_stats)
+    norm_ppl = update_and_normalize(orig_ppl - fixed_ppl, ppl_stats)  # positive = fix lowers ppl
+
+    # Combine with equal weight; result is in (-1, 1)
+    score = 0.5 * norm_align + 0.5 * norm_ppl
+
+    return score, {
+        "alignment_delta": fixed_alignment - orig_alignment,
+        "ppl_delta": orig_ppl - fixed_ppl,
+        "norm_align": norm_align,
+        "norm_ppl": norm_ppl,
+        "semantic_sim": semantic_sim,
+        "faithfulness_penalty": False,
+        "score": score,
+    }
+
+
 def compute_rewards_and_decide_action(
         model, tokenizer, batch_texts, batch_items, responses,
         val_examples, val_embeddings, embedder, device, k=5,
@@ -177,8 +251,6 @@ def compute_rewards_and_decide_action(
     torch.cuda.empty_cache()
 
     actions = []
-    # actions structure: list of dicts:
-    # {'action': 'SFT'|'DPO'|'SKIP', 'item': orig_item, 'fixed_text': str, 'auditor_response': str}
 
     for i, (resp, orig_text) in enumerate(zip(responses, batch_texts)):
         try:
@@ -190,86 +262,66 @@ def compute_rewards_and_decide_action(
             diag = data.get("diagnosis", "N/A")
             item_id = batch_items[i]['id']
             old_conversation = batch_items[i]['conversations']
-            fixed_conversation = make_fixed_conversation(batch_items[i], fixed_text)['conversations']
+
             print("Status:", status)
 
-            if status != "CLEAN":
-                print('***********************DIRTY*****************')
-                print('Item id', item_id)
-                print("Fixed text:", fixed_text)
-                print('\n\nOriginal text:', orig_text)
-
-
-            # --- Check Alignment of Original ---
-            orig_encoding = encode_examples_for_model([batch_items[i]], tokenizer, device)
-            with torch.enable_grad():
-                orig_grad, _ = compute_gradient_vector(model, orig_encoding, lora_params)
-            del orig_encoding
-
-            orig_alignment = F.cosine_similarity(orig_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
-            del orig_grad
-
             if status == "CLEAN":
+                # No fix attempted — straight SFT
                 actions.append({
                     'action': 'SFT_CLEAN',
                     'item': batch_items[i],
-                    'auditor_response': resp
+                    'auditor_response': resp,
+                    'quality_score': None,
                 })
             else:
-                # --- Dirty: Evaluate Fix ---
+                print('***********************DIRTY*****************')
+                print('Item id:', item_id)
+                print("Fixed text:", fixed_text)
+                print('\n\nOriginal text:', orig_text)
+
+                # Compute continuous quality score
+                score, components = compute_quality_score(
+                    model, tokenizer, batch_items[i], orig_text, fixed_text,
+                    val_grad, lora_params, embedder, device
+                )
+
+                print(
+                    f"Quality score: {score:+.3f} | "
+                    f"align_delta={components.get('alignment_delta', 0):.3f} | "
+                    f"ppl_delta={components.get('ppl_delta', 0):.3f} | "
+                    f"sem_sim={components['semantic_sim']:.2f}"
+                )
+
                 fixed_item = make_fixed_conversation(batch_items[i], fixed_text)
-                fixed_encoding = encode_examples_for_model([fixed_item], tokenizer, device)
-                with torch.enable_grad():
-                    fixed_grad, _ = compute_gradient_vector(model, fixed_encoding, lora_params)
-                del fixed_encoding
+                fixed_conversation = fixed_item['conversations']
 
-                fixed_alignment = F.cosine_similarity(fixed_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
-                del fixed_grad
+                # score > 0  → fix is better   → DPO: chosen=fixed, rejected=original
+                # score <= 0 → fix is worse     → DPO: chosen=original, rejected=fixed  (flipped)
+                fix_worked = bool(score > 0)
 
-                # Check Faithfulness (Semantic Similarity)
-                with torch.no_grad():
-                    orig_emb = embedder.encode(orig_text, convert_to_tensor=True).cpu()
-                    fixed_emb = embedder.encode(fixed_text, convert_to_tensor=True).cpu()
-                    semantic_sim = F.cosine_similarity(orig_emb.unsqueeze(0), fixed_emb.unsqueeze(0)).item()
-
-                faithfulness_gate = 1.0 if semantic_sim > 0.8 else 0.1
-
-                # Check PPL improvement
-                orig_ppl = compute_perplexity(model, tokenizer, batch_items[i], device)
-                fixed_ppl = compute_perplexity(model, tokenizer, fixed_item, device)
-
-                # Composite Score
-                alignment_delta = update_and_normalize(fixed_alignment - orig_alignment, align_stats)
-                ppl_delta = update_and_normalize(orig_ppl - fixed_ppl,
-                                                 ppl_stats)  # higher orig ppl (bad) - lower fixed ppl (good) = positive
-
-                score = 0.5 * alignment_delta + 0.5 * ppl_delta
-
-                print(f"Fix Score: {score:.3f} | Faithful: {semantic_sim:.2f}")
-                fix_worked = False
-                if score > 0 and faithfulness_gate == 1.0:
-                    fix_worked = True
-                    print("Successful FIX! Scheduling DPO.")
-                    actions.append({
-                        'action': 'DPO_FIX',
-                        'item': batch_items[i],
-                        'fixed_text': fixed_text,
-                        'auditor_response': resp
-                    })
+                if fix_worked:
+                    print(f"Fix SUCCEEDED (score={score:+.3f}). DPO chosen=fixed.")
                 else:
-                    print("Failed FIX. Skipping.")
-                    actions.append({'action': 'SKIP'})
+                    print(f"Fix FAILED (score={score:+.3f}). DPO chosen=original, penalising bad fix.")
+
+                actions.append({
+                    'action': 'DPO_FIX',
+                    'item': batch_items[i],
+                    'fixed_text': fixed_text,
+                    'auditor_response': resp,
+                    'quality_score': score,  # signed: positive=good, negative=bad
+                    'fix_worked': fix_worked,
+                })
 
                 log_refined_data(item_id, status, diag, fixed_conversation, old_conversation, fix_worked)
 
         except Exception as e:
-            print(f"JSON Error: {e}")
+            print(f"JSON Error: {e}", resp)
             actions.append({'action': 'SKIP'})
 
     del val_grad
     torch.cuda.empty_cache()
     return actions
-
 
 # ── Optimization Step (DPO + SFT) ─────────────────────────────────────────────
 
@@ -289,13 +341,55 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
     return (per_token_logps * loss_mask).sum(-1)
 
 
+def compute_dpo_loss(model, enc_chosen, enc_rejected, beta=0.1):
+    """
+    Standard DPO loss given pre-built encodings for chosen and rejected.
+    Returns scalar loss tensor (with grad).
+    """
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        out_chosen = model(**enc_chosen)
+        out_rejected = model(**enc_rejected)
+
+    logps_chosen = get_batch_logps(out_chosen.logits, enc_chosen['labels'])
+    logps_rejected = get_batch_logps(out_rejected.logits, enc_rejected['labels'])
+
+    with torch.no_grad():
+        with model.disable_adapter():
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                ref_out_chosen = model(**enc_chosen)
+                ref_out_rejected = model(**enc_rejected)
+
+    ref_logps_chosen = get_batch_logps(ref_out_chosen.logits, enc_chosen['labels'])
+    ref_logps_rejected = get_batch_logps(ref_out_rejected.logits, enc_rejected['labels'])
+
+    pi_logratios = logps_chosen - logps_rejected
+    ref_logratios = ref_logps_chosen - ref_logps_rejected
+    dpo_loss = -F.logsigmoid(beta * (pi_logratios - ref_logratios)).mean()
+
+    del out_chosen, out_rejected, ref_out_chosen, ref_out_rejected
+    return dpo_loss
+
 
 def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, beta=0.1):
     """
     Handles:
-    1. SFT on Auditor Output (To keep model speaking JSON)
-    2. SFT on Clean Conversation
-    3. DPO on Fixed vs Original Conversation
+    1. SFT on auditor output (keeps JSON format alive)
+    2. SFT on clean conversation
+    3. Quality-scaled DPO on dirty conversations
+
+    Quality-scaled DPO logic
+    ─────────────────────────
+    Let q = quality_score ∈ (-1, 1)  (positive = fix is better)
+
+    Case A  q > 0  (fix succeeded):
+        chosen=fixed, rejected=original
+        dpo_weight = 1.0 - q          # better fix → less correction needed → smaller weight
+        total_dpo = dpo_weight * base_dpo_loss
+
+    Case B  q ≤ 0  (fix failed):
+        chosen=original, rejected=fixed  ← FLIPPED, penalises the bad fix
+        dpo_weight = 1.0 + |q|         # worse fix → harder punishment → larger weight
+        total_dpo = dpo_weight * base_dpo_loss
     """
     model.train()
     total_loss = torch.tensor(0.0, device=device)
@@ -309,33 +403,25 @@ def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, bet
 
         valid_batch = True
 
-        # ── 1. AUDITOR MAINTENANCE (Crucial for preventing JSON collapse) ──
-        # We SFT on the prompt + the VALID auditor response (JSON)
+        # ── 1. AUDITOR MAINTENANCE ──
         auditor_resp = action_data.get('auditor_response', '')
         if auditor_resp:
             auditor_text = prompt_text + auditor_resp
-            # Basic tokenization for SFT
             auditor_enc = tokenizer(auditor_text, return_tensors='pt', truncation=True, max_length=1024).to(device)
-            # Mask the prompt part for loss
             prompt_enc = tokenizer(prompt_text, return_tensors='pt', add_special_tokens=False)
             labels = auditor_enc.input_ids.clone()
             labels[:, :prompt_enc.input_ids.shape[1]] = -100
-            # Ensure token_type_ids is present if the tokenizer didn't automatically generate it
             if "token_type_ids" not in auditor_enc:
                 auditor_enc["token_type_ids"] = torch.zeros_like(auditor_enc.input_ids)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                 auditor_out = model(**auditor_enc, labels=labels)
 
-            # Weighted less so it doesn't dominate, but keeps the JSON format alive
             total_loss += 0.8 * auditor_out.loss
-            if action_type == 'SFT_AUDITOR_ONLY':
-                print("Auditor response:", auditor_resp, "Total loss", total_loss)
             del auditor_enc, auditor_out
 
-        # ── 2. CONVERSATIONAL OPTIMIZATION ──
+        # ── 2. SFT on clean conversation ──
         if action_type == 'SFT_CLEAN':
-            # Standard SFT on the conversation
             item = action_data['item']
             sft_encoding = encode_examples_for_model([item], tokenizer, device)
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -343,45 +429,35 @@ def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, bet
             total_loss += sft_out.loss
             del sft_encoding, sft_out
 
+        # ── 3. Quality-scaled DPO on dirty conversation ──
         elif action_type == 'DPO_FIX':
-            # DPO: Chosen (Fixed) vs Rejected (Original)
             item = action_data['item']
             fixed_text = action_data['fixed_text']
+            q = action_data['quality_score']  # signed float in (-1, 1)
+            fix_worked = action_data['fix_worked']  # bool
 
             item_fixed = make_fixed_conversation(item, fixed_text)
 
-            # Prepare inputs
-            enc_chosen = encode_examples_for_model([item_fixed], tokenizer, device)
-            enc_rejected = encode_examples_for_model([item], tokenizer, device)
+            enc_fixed = encode_examples_for_model([item_fixed], tokenizer, device)
+            enc_original = encode_examples_for_model([item], tokenizer, device)
 
-            # Get Policy Logprobs
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out_chosen = model(**enc_chosen)
-                out_rejected = model(**enc_rejected)
+            if fix_worked:
+                # Fix is better: reinforce fixed, suppress original
+                # Weight < 1: the better the fix, the less extra pressure needed
+                enc_chosen, enc_rejected = enc_fixed, enc_original
+                dpo_weight = 1.0 - abs(q)  # q ∈ (0,1) → weight ∈ (0,1)
+                print(f"  DPO (fix succeeded): weight={dpo_weight:.3f} (q={q:+.3f})")
+            else:
+                # Fix is worse: reinforce original, suppress bad fix  ← flipped polarity
+                # Weight > 1: the worse the fix, the harder we punish
+                enc_chosen, enc_rejected = enc_original, enc_fixed
+                dpo_weight = 1.0 + abs(q)  # q ∈ (-1,0] → weight ∈ (1,2]
+                print(f"  DPO (fix failed):    weight={dpo_weight:.3f} (q={q:+.3f})")
 
-            logps_chosen = get_batch_logps(out_chosen.logits, enc_chosen['labels'])
-            logps_rejected = get_batch_logps(out_rejected.logits, enc_rejected['labels'])
+            base_dpo_loss = compute_dpo_loss(model, enc_chosen, enc_rejected, beta=beta)
+            total_loss += dpo_weight * base_dpo_loss
 
-            # Get Reference Logprobs (Using disabled adapters to act as Ref model)
-            with torch.no_grad():
-                with model.disable_adapter():
-                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        ref_out_chosen = model(**enc_chosen)
-                        ref_out_rejected = model(**enc_rejected)
-
-            ref_logps_chosen = get_batch_logps(ref_out_chosen.logits, enc_chosen['labels'])
-            ref_logps_rejected = get_batch_logps(ref_out_rejected.logits, enc_rejected['labels'])
-
-            # DPO Loss Calculation
-            pi_logratios = logps_chosen - logps_rejected
-            ref_logratios = ref_logps_chosen - ref_logps_rejected
-
-            logits = pi_logratios - ref_logratios
-            dpo_loss = -F.logsigmoid(beta * logits).mean()
-
-            total_loss += dpo_loss
-
-            del enc_chosen, enc_rejected, out_chosen, out_rejected
+            del enc_fixed, enc_original
 
     if valid_batch:
         optimizer.zero_grad()
@@ -391,6 +467,7 @@ def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, bet
         return total_loss.item()
     else:
         return 0.0
+
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
@@ -498,7 +575,7 @@ if __name__ == '__main__':
     # This part remains exactly the same as your original script
     model_id = "google/gemma-3-12b-it"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size = 1
+    batch_size = 2
     SAVE_PATH = "data/refined_nemotron_dataset.jsonl"
 
     bnb_config = BitsAndBytesConfig(

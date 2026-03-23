@@ -1,0 +1,25 @@
+I'm developing a new learning framework.
+
+I have bunch of learning examples inside a json file that look like this:
+{"id": "18378", "conversations": [{"from": "human", "value": "Kako bi pojasnil delovanje interneta svojemu dedku?"}, {"from": "gpt", "value": "Internet lahko razložimo kot mrežo, ki povezuje računalnike in druge naprave po vsem svetu, omogoča pa nam, da pošiljamo in prejemamo informacije, kot so e-pošta, spletne strani, videoposnetki in še veliko več. \n\nPredstavljajte si internet kot ogromno mesto, kjer vsaka hiša predstavlja računalnik ali drugo napravo, ki je povezana na internet. Ulice med hišami so kot kabli in brezžične povezave, ki omogočajo, da informacije potujejo od ene hiše do druge. Ko na primer pošljete e-pošto, se ta spremeni v digitalne informacije, ki potujejo po teh \"ulicah\" do hiše (računalnika) prejemnika.\n\nVsaka naprava na internetu ima svoj edinstveni naslov, imenovan IP naslov, ki deluje podobno kot poštni naslov hiše. To omogoča, da informacije najdejo pravo pot do ciljne naprave.\n\nKo želite obiskati spletno stran, vaš računalnik pošlje zahtevo preko teh povezav do strežnika, kjer je spletna stran shranjena. Strežnik nato pošlje podatke nazaj vašemu računalniku, ki jih prikaže kot spletno stran, ki jo vidite na zaslonu.\n\nInternet deluje s pomočjo različnih tehnologij in protokolov, ki skrbijo, da so informacije pravilno poslane, prejete in prikazane. To je kot pošiljanje pisma z navodili, kako ga odpreti in prebrati, tako da vsi, ki sodelujejo v procesu, vedo, kaj storiti."}]}
+
+Instead of doing SFT on this, I want to try something else:
+I want to train Gemma-3-12b model in the following way:
+
+1.) Ask Gemma to first answer a question (e.g., "Kako bi pojasnil delovanje interneta svojemu dedku?")
+2.) Once answered, ask the same model to act as judge, and compare the answer it produced to the gold standard answer
+("Internet lahko razložimo kot mrežo..."). I want the judge to consider several factors, such as grammar, semantics, flow, etc., and
+return a score (from 1-5) for each of the criteria. The scores for each of the criteria should be aggregated into the final score that will
+act as a weight during learning.
+4.) Besides LLM as a judge score, add some other semantic eval guardrails here: e.g., if the generated answer is semantically too far away from
+GS, discard it (you can use SentenceTransformer('all-MiniLM-L6-v2') to get semantic representations and then use cosine similarity to get the distance)
+3.) Do the DPO training, where the better evaluated answer (either the GS answer or the generated answer) is the chosen one. I want the
+DPO to consider the weights from eval. i want to add additional factors to the loss here, e.g., higher rewards if the model thinks before answering
+(thinking should be done between <think> and </think> tokens, add them to the voca if they don't exist)
+4.) Besides DPO, also do SFT for the LLM as a judge prompt + answer to make sure that the judging capability doesn't degrade during training
+
+Other:
+- I want to use Lora
+- For tokenization I want to use apply_chat_template
+
+Please give the python code for this framework.
