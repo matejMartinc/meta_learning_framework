@@ -62,7 +62,6 @@ class FrameworkConfig:
     min_think_tokens: int = 20
     learning_rate: float = 5e-5
     num_epochs: int = 1
-    # VRAM is heavily optimized now. You can likely increase batch_size to 4 or 8 for faster processing!
     batch_size: int = 2
     grad_accumulation_steps: int = 8
     warmup_steps: int = 50
@@ -135,7 +134,7 @@ def _criterion_description(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model loading (Optimized to use ONE base model with TWO adapters)
+# Model loading
 # ---------------------------------------------------------------------------
 def _build_bnb_config(cfg: FrameworkConfig) -> Optional[BitsAndBytesConfig]:
     if not cfg.load_in_4bit:
@@ -179,14 +178,9 @@ def load_model_and_tokenizer(cfg: FrameworkConfig):
         model = prepare_model_for_kbit_training(model)
 
     lora_config = _build_lora_config(cfg)
-
-    # 1. Add "default" adapter for active policy training
     model = get_peft_model(model, lora_config, adapter_name="default")
-
-    # 2. Add "ref" adapter for the frozen reference model (Saves ~7GB VRAM)
     model.add_adapter("ref", lora_config)
 
-    # Freeze the ref adapter so it doesn't get updated during backwards pass
     for name, param in model.named_parameters():
         if "ref" in name:
             param.requires_grad_(False)
@@ -196,7 +190,6 @@ def load_model_and_tokenizer(cfg: FrameworkConfig):
 
 
 def sync_ref_model(model) -> None:
-    """Copy current policy LoRA adapter weights ('default') into the reference adapter ('ref')."""
     copied = 0
     with torch.no_grad():
         state_dict = dict(model.named_parameters())
@@ -215,10 +208,6 @@ def sync_ref_model(model) -> None:
 
 @contextmanager
 def left_padding(tokenizer: AutoTokenizer):
-    """
-    Temporarily switch the tokenizer to left-padding for batched generation,
-    then restore to right-padding (required for training forward passes).
-    """
     original = tokenizer.padding_side
     tokenizer.padding_side = "left"
     try:
@@ -237,19 +226,15 @@ def generate_answers_batch(
         cfg: FrameworkConfig,
         system_prompt: Optional[str] = None,
 ) -> list[str]:
-    """
-    Generate answers for a batch of questions in one forward pass.
-    Forces the model to output <think> tokens by appending them to the prompt.
-    """
     if system_prompt is None:
         system_prompt = (
             "You are a helpful assistant. "
             "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. "
-            f"Before answering, reason step by step inside {THINK_START}...{THINK_END} tags. "
+            f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. "
+            f"You MUST include the closing {THINK_END} tag when you are done reasoning! "
             "Then provide your final answer."
         )
 
-    # Build per-item chat prompts and FORCE <think> token at the start of generation
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "system", "content": system_prompt},
@@ -271,14 +256,13 @@ def generate_answers_batch(
 
     prompt_lengths = inputs["attention_mask"].sum(dim=1)
 
-    # torch.inference_mode() is faster than no_grad()
     with torch.inference_mode():
         output_ids = model.generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             max_new_tokens=cfg.max_new_tokens,
             do_sample=False,
-            use_cache=True,  # Speeds up generation
+            use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
         )
 
@@ -286,8 +270,14 @@ def generate_answers_batch(
     for i, prompt_len in enumerate(prompt_lengths.tolist()):
         new_ids = output_ids[i, inputs["input_ids"].shape[1]:]
         text = tokenizer.decode(new_ids, skip_special_tokens=False).strip()
-        # Prepend the forced token back into the resulting string
-        text = f"{THINK_START}\n" + text
+
+        # Strip generation artifacts like eos/pad tokens so they don't break logic
+        if tokenizer.eos_token:
+            text = text.replace(tokenizer.eos_token, "")
+        if tokenizer.pad_token:
+            text = text.replace(tokenizer.pad_token, "")
+
+        text = f"{THINK_START}\n" + text.strip()
         results.append(text)
     return results
 
@@ -318,6 +308,9 @@ def judge_answers_batch(
             f"ANSWER 1:\n{a1}\n\n"
             f"ANSWER 2:\n{a2}"
         )
+        print('\n*******************************\n')
+        print(user_content)
+        print('------------------------------------')
         prompts.append(
             tokenizer.apply_chat_template(
                 [{"role": "system", "content": judge_system_prompt},
@@ -397,6 +390,7 @@ class SemanticGuardrail:
         keep = []
         for i in range(n):
             sim = float(cosine_similarity([gen_embs[i]], [gold_embs[i]])[0][0])
+            print(f"[Semantic] cosine = {sim:.4f}")
             keep.append(sim >= threshold)
         return keep
 
@@ -417,22 +411,30 @@ class TrainingExample:
 
 
 # ---------------------------------------------------------------------------
-# Think-tag helpers
+# Think-tag helpers (FIXED)
 # ---------------------------------------------------------------------------
 def strip_thinking(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    if THINK_START in text:
-        text = text.split(THINK_START)[0]
-    return text.strip()
+    """Safely strip thinking tags. If </think> is missing, returns the text without returning empty strings."""
+    if THINK_END in text:
+        # Properly closed: take everything after </think>
+        return text.split(THINK_END)[-1].strip()
+
+    # Not closed: just remove the <think> literal so we don't evaluate empty strings vs the gold standard
+    return text.replace(THINK_START, "").strip()
 
 
 def has_thinking(text: str, tokenizer, min_tokens: int) -> bool:
-    match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
-    if not match:
+    """Count tokens even if the model failed to close the tag."""
+    if THINK_END in text:
+        think_content = text.split(THINK_START)[-1].split(THINK_END)[0].strip()
+    elif THINK_START in text:
+        think_content = text.split(THINK_START)[-1].strip()
+    else:
         return False
-    think_content = match.group(1).strip()
+
     if not think_content:
         return False
+
     return len(tokenizer.encode(think_content, add_special_tokens=False)) >= min_tokens
 
 
@@ -446,13 +448,13 @@ def build_dpo_prompt(question: str, tokenizer: AutoTokenizer) -> str:
             "content": (
                 "You are a helpful assistant. "
                 "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. "
-                f"Before answering, reason inside  {THINK_START}...{THINK_END} tags, "
-                "then provide your final answer."
+                f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. "
+                f"You MUST include the closing {THINK_END} tag when you are done reasoning! "
+                "Then provide your final answer."
             ),
         },
         {"role": "user", "content": question},
     ]
-    # Intentionally do NOT append <think>\n here, because chosen/rejected completion strings already have it prepended
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -475,10 +477,13 @@ def build_online_batch(
         questions.append(convs[0]["value"] if len(convs) >= 1 else "")
         golds.append(convs[1]["value"] if len(convs) >= 2 else "")
 
-    # 1. Batch generation
     generated_raw = generate_answers_batch(model, tokenizer, questions, cfg)
 
-    # 2. Batch semantic guardrail
+    for i, g in enumerate(zip(questions, generated_raw)):
+        print(f"[Question {i}] {g[0]}")
+        print(f"[Gen {i}] {g[1]}")
+
+    # With the new strip_thinking, this clean_gens array will accurately contain text, not empty strings!
     clean_gens = [strip_thinking(g) for g in generated_raw]
     keep_mask = guardrail.filter_batch(clean_gens, golds, cfg.min_cosine_similarity)
 
@@ -490,7 +495,6 @@ def build_online_batch(
     if not passing_idx:
         return [None] * len(items)
 
-    # 3. Batch judging
     pass_questions = [questions[i] for i in passing_idx]
     pass_clean_gens = [clean_gens[i] for i in passing_idx]
     pass_golds = [golds[i] for i in passing_idx]
@@ -501,7 +505,6 @@ def build_online_batch(
         cfg, judge_system_prompt,
     )
 
-    # 4. Package
     output: list[Optional[TrainingExample]] = [None] * len(items)
 
     for rank, orig_idx in enumerate(passing_idx):
@@ -556,7 +559,7 @@ def build_online_batch(
 
 
 # ---------------------------------------------------------------------------
-# Loss functions (VRAM OPTIMIZED)
+# Loss functions
 # ---------------------------------------------------------------------------
 def batched_log_probs(
         model,
@@ -566,10 +569,6 @@ def batched_log_probs(
         max_len: int,
         no_grad: bool = False,
 ) -> list[torch.Tensor]:
-    """
-    Highly VRAM-optimized logprob computation. Avoids instantiating full
-    vocabulary F.log_softmax matrices.
-    """
     assert len(prompts) == len(completions)
 
     encoded_full = []
@@ -613,11 +612,9 @@ def batched_log_probs(
             )
             logits = outputs.logits
 
-    # VRAM OPTIMIZATION: Avoid huge F.log_softmax(..., dim=-1) over the entire vocab
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = padded_ids[:, 1:].contiguous().unsqueeze(-1)
 
-    # Free up memory immediately
     del outputs, logits
 
     token_logits = shift_logits.gather(2, shift_labels).squeeze(-1)
@@ -755,8 +752,7 @@ def train_online(
             batch_items = epoch_data[batch_start: batch_start + cfg.batch_size]
             print(f"\n[Epoch {epoch + 1} | Items {batch_start + 1}–{batch_start + len(batch_items)}/{len(epoch_data)}]")
 
-            # ---- Generation + judging (eval mode) --------------------------
-            model.set_adapter("default")  # Use active policy
+            model.set_adapter("default")
             model.eval()
             examples = build_online_batch(
                 batch_items, model, tokenizer, guardrail, cfg, judge_system_prompt
@@ -769,14 +765,12 @@ def train_online(
                 print("[Batch] All items discarded by guardrail — skipping.")
                 continue
 
-            # --- Batched DPO ------------------------------------------------
             dpo_prompts = [ex.dpo_prompt for ex in valid_examples]
             chosen_completions = [ex.chosen_completion for ex in valid_examples]
             rejected_completions = [ex.rejected_completion for ex in valid_examples]
             reward_weights = [ex.reward_weight for ex in valid_examples]
             n = len(valid_examples)
 
-            # 1. Reference Logprobs (Using the frozen "ref" adapter on the SAME base model)
             model.set_adapter("ref")
             model.eval()
             ref_lps = batched_log_probs(
@@ -788,7 +782,6 @@ def train_online(
             ref_lp_chosen = ref_lps[:n]
             ref_lp_rejected = ref_lps[n:]
 
-            # 2. Policy Logprobs
             model.set_adapter("default")
             model.train()
             pol_lps = batched_log_probs(
@@ -807,7 +800,6 @@ def train_online(
                 reward_weights=reward_weights,
             )
 
-            # --- Batched SFT ------------------------------------------------
             judge_prompts = [ex.judge_prompt for ex in valid_examples]
             judge_responses = [ex.judge_response for ex in valid_examples]
 
@@ -816,7 +808,6 @@ def train_online(
                 judge_prompts, judge_responses, cfg.max_seq_len,
             )
 
-            # --- Combined loss and backward ---------------------------------
             loss = loss_dpo + cfg.sft_loss_weight * loss_sft
 
             effective_batch = len(valid_examples)
@@ -858,7 +849,6 @@ def train_online(
         print(f"\n[Epoch {epoch + 1}] Skipped {skipped}/{len(epoch_data)} items (guardrail).")
 
         ckpt = f"{cfg.output_dir}/epoch_{epoch + 1}"
-        # Make sure default adapter is active during save
         model.set_adapter("default")
         model.save_pretrained(ckpt)
         tokenizer.save_pretrained(ckpt)
