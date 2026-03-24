@@ -18,6 +18,7 @@ from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_tr
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from torch.optim import AdamW
+from langdetect import detect
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ class FrameworkConfig:
     ref_update_interval: int = 100
 
     # Generation
-    max_new_tokens: int = 2048
+    max_new_tokens: int = 1024
     temperature: float = 0.7
     top_p: float = 0.9
 
@@ -83,17 +84,6 @@ class FrameworkConfig:
 
 THINK_START = "<think>"
 THINK_END = "</think>"
-SPECIAL_TOKENS = [THINK_START, THINK_END]
-
-
-def add_special_tokens(tokenizer: AutoTokenizer) -> None:
-    existing = set(tokenizer.get_vocab().keys())
-    new_tokens = [t for t in SPECIAL_TOKENS if t not in existing]
-    if new_tokens:
-        tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
-        print(f"[Tokenizer] Added special tokens: {new_tokens}")
-    else:
-        print("[Tokenizer] Special tokens already present.")
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +153,6 @@ def load_model_and_tokenizer(cfg: FrameworkConfig):
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    add_special_tokens(tokenizer)
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
@@ -172,7 +161,6 @@ def load_model_and_tokenizer(cfg: FrameworkConfig):
         torch_dtype=torch.bfloat16 if not cfg.load_in_4bit else None,
         attn_implementation="flash_attention_2"
     )
-    model.resize_token_embeddings(len(tokenizer))
 
     if cfg.load_in_4bit:
         model = prepare_model_for_kbit_training(model)
@@ -226,23 +214,23 @@ def generate_answers_batch(
         cfg: FrameworkConfig,
         system_prompt: Optional[str] = None,
 ) -> list[str]:
-    if system_prompt is None:
-        system_prompt = (
-            "You are a helpful assistant. "
-            "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. "
-            f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. "
-            f"You MUST include the closing {THINK_END} tag when you are done reasoning! "
-            "Then provide your final answer."
-        )
+
+    prompt = "You are a helpful assistant. "\
+             "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. "\
+             f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. "\
+             f"You MUST include the closing {THINK_END} tag when you are done reasoning! "\
+             "Then provide your final answer. \nQuestion:\n"
 
     prompts = [
         tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_prompt},
-             {"role": "user", "content": q}],
+            [{"role": "system", "content": ""},
+             {"role": "user", "content": prompt + q}],
             tokenize=False, add_generation_prompt=True,
-        ) + f"{THINK_START}\n"
+        )
         for q in questions
     ]
+
+    print(prompts)
 
     with left_padding(tokenizer):
         inputs = tokenizer(
@@ -269,6 +257,7 @@ def generate_answers_batch(
     results = []
     for i, prompt_len in enumerate(prompt_lengths.tolist()):
         new_ids = output_ids[i, inputs["input_ids"].shape[1]:]
+        print("Generation len:", len(new_ids))
         text = tokenizer.decode(new_ids, skip_special_tokens=False).strip()
 
         # Strip generation artifacts like eos/pad tokens so they don't break logic
@@ -277,7 +266,8 @@ def generate_answers_batch(
         if tokenizer.pad_token:
             text = text.replace(tokenizer.pad_token, "")
 
-        text = f"{THINK_START}\n" + text.strip()
+        text = text.strip()
+        print(text)
         results.append(text)
     return results
 
@@ -308,9 +298,6 @@ def judge_answers_batch(
             f"ANSWER 1:\n{a1}\n\n"
             f"ANSWER 2:\n{a2}"
         )
-        print('\n*******************************\n')
-        print(user_content)
-        print('------------------------------------')
         prompts.append(
             tokenizer.apply_chat_template(
                 [{"role": "system", "content": judge_system_prompt},
@@ -391,7 +378,9 @@ class SemanticGuardrail:
         for i in range(n):
             sim = float(cosine_similarity([gen_embs[i]], [gold_embs[i]])[0][0])
             print(f"[Semantic] cosine = {sim:.4f}")
-            keep.append(sim >= threshold)
+            same_lang = detect(generated_texts[i]) == detect(gold_texts[i])
+            print("Same language in gs and generated", same_lang)
+            keep.append(sim >= threshold and same_lang)
         return keep
 
 
@@ -442,18 +431,17 @@ def has_thinking(text: str, tokenizer, min_tokens: int) -> bool:
 # DPO prompt builder
 # ---------------------------------------------------------------------------
 def build_dpo_prompt(question: str, tokenizer: AutoTokenizer) -> str:
+    prompt = "You are a helpful assistant. " \
+             "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. " \
+             f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. " \
+             f"You MUST include the closing {THINK_END} tag when you are done reasoning! " \
+             "Then provide your final answer. \nQuestion:\n"
     messages = [
         {
             "role": "system",
-            "content": (
-                "You are a helpful assistant. "
-                "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. "
-                f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. "
-                f"You MUST include the closing {THINK_END} tag when you are done reasoning! "
-                "Then provide your final answer."
-            ),
+            "content": ""
         },
-        {"role": "user", "content": question},
+        {"role": "user", "content": prompt + question},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -479,10 +467,6 @@ def build_online_batch(
 
     generated_raw = generate_answers_batch(model, tokenizer, questions, cfg)
 
-    for i, g in enumerate(zip(questions, generated_raw)):
-        print(f"[Question {i}] {g[0]}")
-        print(f"[Gen {i}] {g[1]}")
-
     # With the new strip_thinking, this clean_gens array will accurately contain text, not empty strings!
     clean_gens = [strip_thinking(g) for g in generated_raw]
     keep_mask = guardrail.filter_batch(clean_gens, golds, cfg.min_cosine_similarity)
@@ -490,7 +474,7 @@ def build_online_batch(
     passing_idx = [i for i, keep in enumerate(keep_mask) if keep]
     for i, keep in enumerate(keep_mask):
         if not keep:
-            print(f"[Guardrail ] DISCARDED — semantically too far from gold.")
+            print(f"[Guardrail ] DISCARDED — semantically too far from gold or wrong language.")
 
     if not passing_idx:
         return [None] * len(items)
@@ -520,6 +504,13 @@ def build_online_batch(
         )
         score_chosen = max(base_weight_gen, base_weight_gs)
         reward_weight = min(1.0, max(score_chosen, score_delta + think_bonus))
+
+        print(
+            f"[Reward] score_gen={base_weight_gen:.3f}  "
+            f"score_gs={base_weight_gs:.3f}  "
+            f"delta={score_delta:.3f}  think_bonus={think_bonus:.1f}  "
+            f"reward_weight={reward_weight:.3f}"
+        )
 
         dpo_prompt = build_dpo_prompt(questions[orig_idx], tokenizer)
 
