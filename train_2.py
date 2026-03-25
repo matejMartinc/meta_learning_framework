@@ -378,7 +378,10 @@ class SemanticGuardrail:
         for i in range(n):
             sim = float(cosine_similarity([gen_embs[i]], [gold_embs[i]])[0][0])
             print(f"[Semantic] cosine = {sim:.4f}")
-            same_lang = detect(generated_texts[i]) == detect(gold_texts[i])
+            try:
+                same_lang = detect(generated_texts[i]) == detect(gold_texts[i])
+            except:
+                same_lang = False
             print("Same language in gs and generated", same_lang)
             keep.append(sim >= threshold and same_lang)
         return keep
@@ -878,7 +881,7 @@ if __name__ == "__main__":
         data_path="data/nemotron_sft_all_final_98k.json",
         num_epochs=1,
         load_in_4bit=True,
-        batch_size=2,
+        batch_size=8,
         output_dir="./checkpoints",
         ref_update_interval=100,
     )
