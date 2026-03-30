@@ -59,15 +59,14 @@ class FrameworkConfig:
 
     # Training
     dpo_beta: float = 0.1
-    thinking_bonus: float = 0.3
-    min_think_tokens: int = 20
     learning_rate: float = 5e-5
     num_epochs: int = 1
-    batch_size: int = 2
-    grad_accumulation_steps: int = 8
+    inference_batch_size: int = 4   # large batch for generation + judging
+    batch_size: int = 4              # smaller sub-batch for SFT + DPO training
+    grad_accumulation_steps: int = 1
     warmup_steps: int = 50
     cosine_cycle_steps: int = 200
-    sft_loss_weight: float = 0.3
+    sft_loss_weight: float = 0.4
     output_dir: str = "./checkpoints"
 
     ref_update_interval: int = 100
@@ -82,8 +81,6 @@ class FrameworkConfig:
 # Special tokens
 # ---------------------------------------------------------------------------
 
-THINK_START = "<think>"
-THINK_END = "</think>"
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +202,20 @@ def left_padding(tokenizer: AutoTokenizer):
 
 
 # ---------------------------------------------------------------------------
+# VRAM cleanup helper
+# ---------------------------------------------------------------------------
+def release_vram(label: str = "") -> None:
+    """Synchronise CUDA, clear the cache and run garbage collection."""
+    import gc
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    tag = f" [{label}]" if label else ""
+    print(f"[VRAM]{tag} Cache cleared.")
+
+
+# ---------------------------------------------------------------------------
 # Batched generation
 # ---------------------------------------------------------------------------
 def generate_answers_batch(
@@ -215,11 +226,9 @@ def generate_answers_batch(
         system_prompt: Optional[str] = None,
 ) -> list[str]:
 
-    prompt = "You are a helpful assistant. "\
-             "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. "\
-             f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. "\
-             f"You MUST include the closing {THINK_END} tag when you are done reasoning! "\
-             "Then provide your final answer. \nQuestion:\n"
+    prompt = "Always respond in a grammatically correct manner using correct noun-adjective gender/number agreement, even if the question contains typos or other grammatically incorrect words." \
+             "\nCRITICAL: Always respond in the SAME LANGUAGE as the user's question. " \
+             "\nProvide your answer to the question below. \nQuestion:\n"
 
     prompts = [
         tokenizer.apply_chat_template(
@@ -242,7 +251,7 @@ def generate_answers_batch(
             max_length=cfg.max_seq_len,
         ).to(model.device)
 
-    prompt_lengths = inputs["attention_mask"].sum(dim=1)
+    input_len = inputs["input_ids"].shape[1]
 
     with torch.inference_mode():
         output_ids = model.generate(
@@ -254,21 +263,19 @@ def generate_answers_batch(
             pad_token_id=tokenizer.pad_token_id,
         )
 
+    # Free the input tensors before decoding
+    del inputs
+    release_vram("post-generation inputs")
+
     results = []
-    for i, prompt_len in enumerate(prompt_lengths.tolist()):
-        new_ids = output_ids[i, inputs["input_ids"].shape[1]:]
-        print("Generation len:", len(new_ids))
-        text = tokenizer.decode(new_ids, skip_special_tokens=False).strip()
-
-        # Strip generation artifacts like eos/pad tokens so they don't break logic
-        if tokenizer.eos_token:
-            text = text.replace(tokenizer.eos_token, "")
-        if tokenizer.pad_token:
-            text = text.replace(tokenizer.pad_token, "")
-
-        text = text.strip()
+    for i in range(len(questions)):
+        new_ids = output_ids[i, input_len:]
+        text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
         print(text)
         results.append(text)
+
+    del output_ids
+    release_vram("post-generation outputs")
     return results
 
 
@@ -281,6 +288,7 @@ def judge_answers_batch(
         questions: list[str],
         generated_answers: list[str],
         gold_answers: list[str],
+        filtered_idx: list[int],
         cfg: FrameworkConfig,
         judge_system_prompt: str,
 ) -> list[tuple[dict, dict]]:
@@ -316,6 +324,8 @@ def judge_answers_batch(
             max_length=cfg.max_seq_len,
         ).to(model.device)
 
+    input_length = inputs["input_ids"].shape[1]
+
     with torch.inference_mode():
         output_ids = model.generate(
             input_ids=inputs["input_ids"],
@@ -326,27 +336,43 @@ def judge_answers_batch(
             pad_token_id=tokenizer.pad_token_id,
         )
 
+    generated_tokens = output_ids[:, input_length:]
+
+    del inputs
+    release_vram("post-judge inputs")
+
     results = []
     for i, (_, _, generated_key, gs_key) in enumerate(orderings):
-        new_ids = output_ids[i, inputs["input_ids"].shape[1]:]
+        new_ids = generated_tokens[i]
         raw = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-
-        try:
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
-            scores = json.loads(cleaned)
-            scores_generated = scores[generated_key]
-            scores_gs = scores[gs_key]
-            for k in cfg.judge_criteria:
-                scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
-                scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
-            results.append((scores_generated, scores_gs))
-        except (json.JSONDecodeError, KeyError, ValueError):
-            print(f"[Judge ] Parse failed — using fallback (1 vs 5).")
+        if i in filtered_idx:
+            print(f"Filtered out (using 1 vs 5) for idx:", i)
             results.append(
                 ({k: 1 for k in cfg.judge_criteria},
                  {k: 5 for k in cfg.judge_criteria})
             )
+        else:
+            try:
+                print('----------------------------JUDGE------------------------------')
+                print(raw)
+                print('----------------------------JUDGE------------------------------')
+                cleaned = raw.replace("```json", "").replace("```", "").strip()
+                scores = json.loads(cleaned)
+                scores_generated = scores[generated_key]
+                scores_gs = scores[gs_key]
+                for k in cfg.judge_criteria:
+                    scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
+                    scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
+                results.append((scores_generated, scores_gs))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                print(f"[Judge ] Parse failed — using fallback (1 vs 5).")
+                results.append(
+                    ({k: 1 for k in cfg.judge_criteria},
+                     {k: 5 for k in cfg.judge_criteria})
+                )
 
+    del output_ids
+    release_vram("post-judge outputs")
     return results
 
 
@@ -378,7 +404,10 @@ class SemanticGuardrail:
         for i in range(n):
             sim = float(cosine_similarity([gen_embs[i]], [gold_embs[i]])[0][0])
             print(f"[Semantic] cosine = {sim:.4f}")
-            same_lang = detect(generated_texts[i]) == detect(gold_texts[i])
+            try:
+                same_lang = detect(generated_texts[i]) == detect(gold_texts[i])
+            except:
+                same_lang = False
             print("Same language in gs and generated", same_lang)
             keep.append(sim >= threshold and same_lang)
         return keep
@@ -399,49 +428,17 @@ class TrainingExample:
     judge_response: str
 
 
-# ---------------------------------------------------------------------------
-# Think-tag helpers (FIXED)
-# ---------------------------------------------------------------------------
-def strip_thinking(text: str) -> str:
-    """Safely strip thinking tags. If </think> is missing, returns the text without returning empty strings."""
-    if THINK_END in text:
-        # Properly closed: take everything after </think>
-        return text.split(THINK_END)[-1].strip()
-
-    # Not closed: just remove the <think> literal so we don't evaluate empty strings vs the gold standard
-    return text.replace(THINK_START, "").strip()
-
-
-def has_thinking(text: str, tokenizer, min_tokens: int) -> bool:
-    """Count tokens even if the model failed to close the tag."""
-    if THINK_END in text:
-        think_content = text.split(THINK_START)[-1].split(THINK_END)[0].strip()
-    elif THINK_START in text:
-        think_content = text.split(THINK_START)[-1].strip()
-    else:
-        return False
-
-    if not think_content:
-        return False
-
-    return len(tokenizer.encode(think_content, add_special_tokens=False)) >= min_tokens
-
 
 # ---------------------------------------------------------------------------
 # DPO prompt builder
 # ---------------------------------------------------------------------------
 def build_dpo_prompt(question: str, tokenizer: AutoTokenizer) -> str:
-    prompt = "You are a helpful assistant. " \
-             "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. " \
-             f"You MUST reason step by step inside {THINK_START} and {THINK_END} tags first. " \
-             f"You MUST include the closing {THINK_END} tag when you are done reasoning! " \
-             "Then provide your final answer. \nQuestion:\n"
     messages = [
         {
             "role": "system",
             "content": ""
         },
-        {"role": "user", "content": prompt + question},
+        {"role": "user", "content": question},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -449,9 +446,11 @@ def build_dpo_prompt(question: str, tokenizer: AutoTokenizer) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Batched online example builder
+# Inference phase: generate + guardrail + judge for a large inference batch
+# Returns a flat list of TrainingExample (or None for discarded items).
+# The model must already be set to "default" adapter and eval() before calling.
 # ---------------------------------------------------------------------------
-def build_online_batch(
+def run_inference_phase(
         items: list[dict],
         model,
         tokenizer,
@@ -459,66 +458,76 @@ def build_online_batch(
         cfg: FrameworkConfig,
         judge_system_prompt: str,
 ) -> list[Optional[TrainingExample]]:
+    """
+    Phase 1 – Generation (inference batch = cfg.inference_batch_size)
+    Phase 2 – Semantic guardrail (CPU, no GPU memory impact)
+    Phase 3 – Judging (inference batch = cfg.inference_batch_size)
+
+    VRAM is released after generation output tensors are decoded and after
+    judge output tensors are decoded.
+    """
     questions, golds = [], []
     for item in items:
         convs = item.get("conversations", [])
         questions.append(convs[0]["value"] if len(convs) >= 1 else "")
         golds.append(convs[1]["value"] if len(convs) >= 2 else "")
 
+    # ── Phase 1: generation ──────────────────────────────────────────────
+    print(f"[Inference] Generating answers for {len(questions)} questions …")
+    model.set_adapter("default")
+    model.eval()
+
     generated_raw = generate_answers_batch(model, tokenizer, questions, cfg)
 
-    # With the new strip_thinking, this clean_gens array will accurately contain text, not empty strings!
-    clean_gens = [strip_thinking(g) for g in generated_raw]
-    keep_mask = guardrail.filter_batch(clean_gens, golds, cfg.min_cosine_similarity)
+    keep_mask = guardrail.filter_batch(generated_raw, golds, cfg.min_cosine_similarity)
 
-    passing_idx = [i for i, keep in enumerate(keep_mask) if keep]
+    filtered_idx = [i for i, keep in enumerate(keep_mask) if not keep]
+    all_idx = [i for i, keep in enumerate(keep_mask)]
     for i, keep in enumerate(keep_mask):
         if not keep:
-            print(f"[Guardrail ] DISCARDED — semantically too far from gold or wrong language.")
+            print(f"[Guardrail] item {i} DISCARDED — too far from gold or wrong language.")
 
-    if not passing_idx:
-        return [None] * len(items)
 
-    pass_questions = [questions[i] for i in passing_idx]
-    pass_clean_gens = [clean_gens[i] for i in passing_idx]
-    pass_golds = [golds[i] for i in passing_idx]
+    pass_questions  = [q for q in questions]
+    pass_clean_gens = [c for c in generated_raw]
+    pass_golds      = [g for g in golds]
 
+    # ── Phase 3: judging ─────────────────────────────────────────────────
+    print(f"[Inference] Judging {len(pass_questions)} surviving answers …")
+    # Still uses "default" adapter / eval mode from generation phase
     judge_results = judge_answers_batch(
         model, tokenizer,
-        pass_questions, pass_clean_gens, pass_golds,
+        pass_questions, pass_clean_gens, pass_golds, filtered_idx,
         cfg, judge_system_prompt,
     )
+    # judge_answers_batch already calls release_vram internally
 
+    # ── Assemble TrainingExamples ────────────────────────────────────────
     output: list[Optional[TrainingExample]] = [None] * len(items)
 
-    for rank, orig_idx in enumerate(passing_idx):
+    for rank, orig_idx in enumerate(all_idx):
         scores_generated, scores_gs = judge_results[rank]
         base_weight_gen = aggregate_score(scores_generated, cfg)
-        base_weight_gs = aggregate_score(scores_gs, cfg)
+        base_weight_gs  = aggregate_score(scores_gs,        cfg)
 
-        score_delta = abs(base_weight_gen - base_weight_gs)
-        think_bonus = (
-            cfg.thinking_bonus
-            if has_thinking(generated_raw[orig_idx], tokenizer, cfg.min_think_tokens)
-            else 0.0
-        )
-        score_chosen = max(base_weight_gen, base_weight_gs)
-        reward_weight = min(1.0, max(score_chosen, score_delta + think_bonus))
+        score_delta  = abs(base_weight_gen - base_weight_gs)
+        score_chosen  = max(base_weight_gen, base_weight_gs)
+        reward_weight = min(1.0, max(score_chosen, score_delta))
 
         print(
             f"[Reward] score_gen={base_weight_gen:.3f}  "
             f"score_gs={base_weight_gs:.3f}  "
-            f"delta={score_delta:.3f}  think_bonus={think_bonus:.1f}  "
+            f"delta={score_delta:.3f} "
             f"reward_weight={reward_weight:.3f}"
         )
 
         dpo_prompt = build_dpo_prompt(questions[orig_idx], tokenizer)
 
         if base_weight_gen >= base_weight_gs:
-            chosen_completion = generated_raw[orig_idx]
+            chosen_completion   = generated_raw[orig_idx]
             rejected_completion = golds[orig_idx]
         else:
-            chosen_completion = golds[orig_idx]
+            chosen_completion   = golds[orig_idx]
             rejected_completion = generated_raw[orig_idx]
 
         sft_user = (
@@ -562,7 +571,7 @@ def batched_log_probs(
 ) -> list[torch.Tensor]:
     assert len(prompts) == len(completions)
 
-    encoded_full = []
+    encoded_full   = []
     encoded_prompt = []
     for p, c in zip(prompts, completions):
         enc_f = tokenizer(
@@ -576,27 +585,27 @@ def batched_log_probs(
         encoded_prompt.append(enc_p)
 
     max_full_len = max(e["input_ids"].shape[1] for e in encoded_full)
-    pad_id = tokenizer.pad_token_id
-    batch_size = len(prompts)
+    pad_id       = tokenizer.pad_token_id
+    batch_size   = len(prompts)
 
-    padded_ids = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long)
+    padded_ids  = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long)
     padded_attn = torch.zeros((batch_size, max_full_len), dtype=torch.long)
     padded_ttids = torch.zeros((batch_size, max_full_len), dtype=torch.long)
 
     for i, enc in enumerate(encoded_full):
         seq_len = enc["input_ids"].shape[1]
-        padded_ids[i, :seq_len] = enc["input_ids"].squeeze(0)
-        padded_attn[i, :seq_len] = enc["attention_mask"].squeeze(0)
+        padded_ids[i,   :seq_len] = enc["input_ids"].squeeze(0)
+        padded_attn[i,  :seq_len] = enc["attention_mask"].squeeze(0)
         padded_ttids[i, :seq_len] = enc["token_type_ids"].squeeze(0)
 
-    padded_ids = padded_ids.to(model.device)
-    padded_attn = padded_attn.to(model.device)
+    padded_ids   = padded_ids.to(model.device)
+    padded_attn  = padded_attn.to(model.device)
     padded_ttids = padded_ttids.to(model.device)
 
     ctx = torch.inference_mode() if no_grad else torch.enable_grad()
     with ctx:
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            outputs = model(
+            outputs  = model(
                 input_ids=padded_ids,
                 attention_mask=padded_attn,
                 token_type_ids=padded_ttids,
@@ -606,43 +615,51 @@ def batched_log_probs(
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = padded_ids[:, 1:].contiguous().unsqueeze(-1)
 
-    del outputs, logits
+    del outputs, logits, padded_ids, padded_attn, padded_ttids
 
     token_logits = shift_logits.gather(2, shift_labels).squeeze(-1)
-    log_z = torch.logsumexp(shift_logits, dim=-1)
-    token_lp = token_logits - log_z
+    log_z        = torch.logsumexp(shift_logits, dim=-1)
+    token_lp     = token_logits - log_z
 
-    del shift_logits, log_z
+    del shift_logits, log_z, token_logits, shift_labels
 
     results = []
     for i, enc_p in enumerate(encoded_prompt):
+        # The prompt length tells us where the completion starts
         prompt_len = enc_p["input_ids"].shape[1]
+        # The full length (prompt + completion)
         seq_len = encoded_full[i]["input_ids"].shape[1]
+        # Shifted labels mean the prediction for the first completion token
+        # is at index [prompt_len - 1] in the shift_logits/token_lp tensor.
+        # We want to sum from the prompt end to the end of the sequence.
 
-        mask = torch.zeros(seq_len - 1, dtype=torch.bool, device=model.device)
-        mask[prompt_len:] = True
-        valid_lp = token_lp[i, :seq_len - 1]
-        masked = valid_lp * mask.float()
-        results.append(masked.sum() / mask.sum().float().clamp(min=1))
+        # Correct indexing:
+        # prompt_len - 1 is the log-prob of the FIRST token of the completion
+        # seq_len - 1 is the log-prob of the LAST token of the completion
+        completion_lp = token_lp[i, prompt_len - 1: seq_len - 1]
 
+        # DO NOT divide by length. Use the raw sum.
+        results.append(completion_lp.sum().clone())
+
+    del token_lp
     return results
 
 
 def dpo_loss_weighted_batch(
-        ref_lp_chosen: list[torch.Tensor],
+        ref_lp_chosen:   list[torch.Tensor],
         ref_lp_rejected: list[torch.Tensor],
-        pol_lp_chosen: list[torch.Tensor],
+        pol_lp_chosen:   list[torch.Tensor],
         pol_lp_rejected: list[torch.Tensor],
         beta: float,
         reward_weights: list[float],
 ) -> torch.Tensor:
     losses = []
     for rc, rr, pc, pr, w in zip(
-            ref_lp_chosen, ref_lp_rejected,
-            pol_lp_chosen, pol_lp_rejected,
+            ref_lp_chosen,   ref_lp_rejected,
+            pol_lp_chosen,   pol_lp_rejected,
             reward_weights,
     ):
-        chosen_ratio = pc - rc
+        chosen_ratio  = pc - rc
         rejected_ratio = pr - rr
         margin = beta * (chosen_ratio - rejected_ratio) * w
         losses.append(-F.logsigmoid(margin))
@@ -659,7 +676,7 @@ def batched_sft_loss(
     assert len(prompts) == len(completions)
     batch_size = len(prompts)
 
-    encoded_full = []
+    encoded_full   = []
     prompt_lengths = []
     for p, c in zip(prompts, completions):
         enc_f = tokenizer(
@@ -675,22 +692,22 @@ def batched_sft_loss(
     max_full_len = max(e["input_ids"].shape[1] for e in encoded_full)
     pad_id = tokenizer.pad_token_id
 
-    padded_ids = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long)
-    padded_attn = torch.zeros((batch_size, max_full_len), dtype=torch.long)
+    padded_ids   = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long)
+    padded_attn  = torch.zeros((batch_size, max_full_len), dtype=torch.long)
     padded_ttids = torch.zeros((batch_size, max_full_len), dtype=torch.long)
-    labels = torch.full((batch_size, max_full_len), -100, dtype=torch.long)
+    labels       = torch.full((batch_size, max_full_len), -100, dtype=torch.long)
 
     for i, (enc, p_len) in enumerate(zip(encoded_full, prompt_lengths)):
         seq_len = enc["input_ids"].shape[1]
-        padded_ids[i, :seq_len] = enc["input_ids"].squeeze(0)
-        padded_attn[i, :seq_len] = enc["attention_mask"].squeeze(0)
+        padded_ids[i,   :seq_len] = enc["input_ids"].squeeze(0)
+        padded_attn[i,  :seq_len] = enc["attention_mask"].squeeze(0)
         padded_ttids[i, :seq_len] = enc["token_type_ids"].squeeze(0)
-        labels[i, p_len:seq_len] = enc["input_ids"].squeeze(0)[p_len:]
+        labels[i, p_len:seq_len]  = enc["input_ids"].squeeze(0)[p_len:]
 
-    padded_ids = padded_ids.to(model.device)
-    padded_attn = padded_attn.to(model.device)
+    padded_ids   = padded_ids.to(model.device)
+    padded_attn  = padded_attn.to(model.device)
     padded_ttids = padded_ttids.to(model.device)
-    labels = labels.to(model.device)
+    labels       = labels.to(model.device)
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         loss = model(
@@ -700,7 +717,137 @@ def batched_sft_loss(
             labels=labels,
         ).loss
 
+    del padded_ids, padded_attn, padded_ttids, labels
     return loss
+
+
+# ---------------------------------------------------------------------------
+# Training phase: consume a list of TrainingExamples in sub-batches
+# Returns (global_step, accum_count, running_loss) updated values.
+# ---------------------------------------------------------------------------
+def run_training_phase(
+        valid_examples: list[TrainingExample],
+        model,
+        tokenizer,
+        cfg: FrameworkConfig,
+        optimizer,
+        scheduler,
+        global_step: int,
+        accum_count: int,
+        running_loss: float,
+) -> tuple[int, int, float]:
+    """
+    Splits *valid_examples* (the output of one inference batch) into
+    sub-batches of size cfg.batch_size and runs SFT + DPO on each one,
+    releasing VRAM between sub-batches.
+    """
+    sub_batches = [
+        valid_examples[i: i + cfg.batch_size]
+        for i in range(0, len(valid_examples), cfg.batch_size)
+    ]
+
+    # Enable gradient checkpointing for training, will be disabled after the loop
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    for sb_idx, sub_batch in enumerate(sub_batches):
+        n = len(sub_batch)
+        print(f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {n} examples")
+
+        dpo_prompts          = [ex.dpo_prompt          for ex in sub_batch]
+        chosen_completions   = [ex.chosen_completion   for ex in sub_batch]
+        rejected_completions = [ex.rejected_completion for ex in sub_batch]
+        reward_weights       = [ex.reward_weight       for ex in sub_batch]
+        judge_prompts        = [ex.judge_prompt        for ex in sub_batch]
+        judge_responses      = [ex.judge_response      for ex in sub_batch]
+
+        # ── Ref log-probs (no grad, ref adapter) ──────────────────────
+        model.set_adapter("ref")
+        model.eval()
+        ref_lps = batched_log_probs(
+            model, tokenizer,
+            dpo_prompts + dpo_prompts,
+            chosen_completions + rejected_completions,
+            cfg.max_seq_len, no_grad=True,
+        )
+        # Detach explicitly: even though no_grad=True, severing the tensor
+        # from any autograd state ensures nothing from the ref forward pass
+        # lingers in memory during the policy forward pass.
+        ref_lp_chosen   = [t.detach() for t in ref_lps[:n]]
+        ref_lp_rejected = [t.detach() for t in ref_lps[n:]]
+        del ref_lps
+
+        release_vram(f"sub-batch {sb_idx + 1} ref logprobs")
+
+        # ── Policy log-probs + SFT (with grad, default adapter) ───────
+        model.set_adapter("default")
+        model.train()
+
+        pol_lps = batched_log_probs(
+            model, tokenizer,
+            dpo_prompts + dpo_prompts,
+            chosen_completions + rejected_completions,
+            cfg.max_seq_len, no_grad=False,
+        )
+        pol_lp_chosen   = pol_lps[:n]
+        pol_lp_rejected = pol_lps[n:]
+        del pol_lps
+
+        loss_dpo = dpo_loss_weighted_batch(
+            ref_lp_chosen,   ref_lp_rejected,
+            pol_lp_chosen,   pol_lp_rejected,
+            beta=cfg.dpo_beta,
+            reward_weights=reward_weights,
+        )
+
+        loss_sft = batched_sft_loss(
+            model, tokenizer,
+            dpo_prompts, chosen_completions, cfg.max_seq_len,
+        )
+
+        print('--------------Chosen completion-------------------------')
+        print("prompts", dpo_prompts)
+        print('\n\n\ Completions', chosen_completions)
+
+        loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
+        (loss / cfg.grad_accumulation_steps).backward()
+
+        running_loss += loss.item()
+        accum_count  += n
+
+        # Free intermediate tensors now that gradients are accumulated
+        del ref_lp_chosen, ref_lp_rejected
+        del pol_lp_chosen, pol_lp_rejected
+        #del loss_dpo, loss_sft, loss
+        del loss_dpo, loss
+        release_vram(f"sub-batch {sb_idx + 1} post-backward")
+
+        # ── Optimizer step when accumulation threshold is reached ──────
+        if accum_count >= cfg.grad_accumulation_steps:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
+            accum_count  = 0
+
+            avg          = running_loss / cfg.grad_accumulation_steps
+            running_loss = 0.0
+            print(
+                f"  Step {global_step:4d} | loss={avg:.4f}"
+            )
+
+            if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
+                sync_ref_model(model)
+
+            release_vram(f"step {global_step} post-optimizer")
+
+    # Disable gradient checkpointing so the next inference phase is clean
+    model.gradient_checkpointing_disable()
+    release_vram("end of training phase")
+
+    return global_step, accum_count, running_loss
 
 
 # ---------------------------------------------------------------------------
@@ -714,9 +861,9 @@ def train_online(
         cfg: FrameworkConfig,
 ) -> None:
     os.makedirs(cfg.output_dir, exist_ok=True)
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
+    # NOTE: gradient checkpointing is enabled only inside run_training_phase
+    # and disabled again before returning, so inference always runs without it.
+    model.gradient_checkpointing_disable()
 
     judge_system_prompt = build_judge_system_prompt(cfg.judge_criteria)
 
@@ -729,113 +876,62 @@ def train_online(
         num_cycles=cfg.num_epochs,
     )
 
-    global_step = 0
+    global_step  = 0
     running_loss = 0.0
-    accum_count = 0
+    accum_count  = 0
+
     for epoch in range(cfg.num_epochs):
         print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{cfg.num_epochs}\n{'=' * 60}")
 
         epoch_data = random.sample(raw_data, len(raw_data))
-        skipped = 0
+        skipped    = 0
         optimizer.zero_grad()
 
-        for batch_start in range(0, len(epoch_data), cfg.batch_size):
-            batch_items = epoch_data[batch_start: batch_start + cfg.batch_size]
-            print(f"\n[Epoch {epoch + 1} | Items {batch_start + 1}–{batch_start + len(batch_items)}/{len(epoch_data)}]")
+        # Iterate over large INFERENCE batches
+        for inf_start in range(0, len(epoch_data), cfg.inference_batch_size):
+            inf_items = epoch_data[inf_start: inf_start + cfg.inference_batch_size]
+            print(
+                f"\n[Epoch {epoch + 1} | Inference items "
+                f"{inf_start + 1}–{inf_start + len(inf_items)}/{len(epoch_data)}]"
+            )
 
-            model.set_adapter("default")
-            model.eval()
-            examples = build_online_batch(
-                batch_items, model, tokenizer, guardrail, cfg, judge_system_prompt
+            # ── INFERENCE PHASE (generation + guardrail + judging) ─────
+            examples = run_inference_phase(
+                inf_items, model, tokenizer, guardrail, cfg, judge_system_prompt
             )
 
             valid_examples = [ex for ex in examples if ex is not None]
-            skipped += sum(1 for ex in examples if ex is None)
+            skipped       += sum(1 for ex in examples if ex is None)
 
             if not valid_examples:
                 print("[Batch] All items discarded by guardrail — skipping.")
                 continue
 
-            dpo_prompts = [ex.dpo_prompt for ex in valid_examples]
-            chosen_completions = [ex.chosen_completion for ex in valid_examples]
-            rejected_completions = [ex.rejected_completion for ex in valid_examples]
-            reward_weights = [ex.reward_weight for ex in valid_examples]
-            n = len(valid_examples)
+            # VRAM is already clean after inference phase; now switch to training
+            release_vram("between inference and training phases")
 
-            model.set_adapter("ref")
-            model.eval()
-            ref_lps = batched_log_probs(
-                model, tokenizer,
-                dpo_prompts + dpo_prompts,
-                chosen_completions + rejected_completions,
-                cfg.max_seq_len, no_grad=True,
+            # ── TRAINING PHASE (sub-batches of cfg.batch_size) ────────
+            print(
+                f"[Train] {len(valid_examples)} valid examples → "
+                f"{(len(valid_examples) + cfg.batch_size - 1) // cfg.batch_size} sub-batches "
+                f"of up to {cfg.batch_size}"
             )
-            ref_lp_chosen = ref_lps[:n]
-            ref_lp_rejected = ref_lps[n:]
-
-            model.set_adapter("default")
-            model.train()
-            pol_lps = batched_log_probs(
-                model, tokenizer,
-                dpo_prompts + dpo_prompts,
-                chosen_completions + rejected_completions,
-                cfg.max_seq_len, no_grad=False,
-            )
-            pol_lp_chosen = pol_lps[:n]
-            pol_lp_rejected = pol_lps[n:]
-
-            loss_dpo = dpo_loss_weighted_batch(
-                ref_lp_chosen, ref_lp_rejected,
-                pol_lp_chosen, pol_lp_rejected,
-                beta=cfg.dpo_beta,
-                reward_weights=reward_weights,
+            global_step, accum_count, running_loss = run_training_phase(
+                valid_examples, model, tokenizer, cfg,
+                optimizer, scheduler,
+                global_step, accum_count, running_loss,
             )
 
-            judge_prompts = [ex.judge_prompt for ex in valid_examples]
-            judge_responses = [ex.judge_response for ex in valid_examples]
-
-            loss_sft = batched_sft_loss(
-                model, tokenizer,
-                judge_prompts, judge_responses, cfg.max_seq_len,
-            )
-
-            loss = loss_dpo + cfg.sft_loss_weight * loss_sft
-
-            effective_batch = len(valid_examples)
-            (loss / cfg.grad_accumulation_steps).backward()
-
-            running_loss += loss.item()
-            accum_count += effective_batch
-
-            if accum_count >= cfg.grad_accumulation_steps:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-                accum_count = 0
-
-                avg = running_loss / cfg.grad_accumulation_steps
-                running_loss = 0.0
-                print(
-                    f"  Step {global_step:4d} | loss={avg:.4f}  dpo={loss_dpo.item():.4f}  "
-                    f"sft={loss_sft.item():.4f}"
-                )
-
-                if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
-                    sync_ref_model(model)
-
-                if global_step % 100 == 0:
-                    torch.cuda.empty_cache()
-
+        # ── Flush any remaining gradient accumulation at end of epoch ─
         if accum_count > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
             global_step += 1
-            accum_count = 0
+            accum_count  = 0
             print(f"  Step {global_step:4d} | flushed partial accumulation batch")
+            release_vram("end-of-epoch flush")
 
         print(f"\n[Epoch {epoch + 1}] Skipped {skipped}/{len(epoch_data)} items (guardrail).")
 
@@ -878,7 +974,8 @@ if __name__ == "__main__":
         data_path="data/nemotron_sft_all_final_98k.json",
         num_epochs=1,
         load_in_4bit=True,
-        batch_size=2,
+        inference_batch_size=8,   # generate + judge 16 at a time
+        batch_size=2,              # train 4 at a time
         output_dir="./checkpoints",
         ref_update_interval=100,
     )
