@@ -1,5 +1,6 @@
 import json
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import random
 import re
 import torch
@@ -42,7 +43,7 @@ class FrameworkConfig:
 
     # Data
     data_path: str = "data/gams_ft_dataset.json"
-    max_seq_len: int = 2048
+    max_seq_len: int = (2 * 1024) + 256
 
     # Semantic guardrail
     semantic_model_name: str = "all-MiniLM-L6-v2"
@@ -61,7 +62,8 @@ class FrameworkConfig:
     dpo_beta: float = 0.1
     learning_rate: float = 5e-5
     num_epochs: int = 1
-    inference_batch_size: int = 4   # large batch for generation + judging
+    inference_batch_size: int = 32   # large batch for generation + judging
+    max_judge_batch_size: int = 8
     batch_size: int = 4              # smaller sub-batch for SFT + DPO training
     grad_accumulation_steps: int = 1
     warmup_steps: int = 50
@@ -248,20 +250,21 @@ def generate_answers_batch(
             padding=True,
             truncation=True,
             add_special_tokens=False,
-            max_length=cfg.max_seq_len,
+            max_length=512,
         ).to(model.device)
 
     input_len = inputs["input_ids"].shape[1]
 
-    with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_new_tokens=cfg.max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+    with torch.no_grad():
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=cfg.max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
 
     # Free the input tensors before decoding
     del inputs
@@ -271,7 +274,9 @@ def generate_answers_batch(
     for i in range(len(questions)):
         new_ids = output_ids[i, input_len:]
         text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-        print(text)
+        print("---------------------Generated text:\n----------------------")
+        print(text[:500])
+        print("------------------------------------------------------------")
         results.append(text)
 
     del output_ids
@@ -500,7 +505,6 @@ def run_inference_phase(
         pass_questions, pass_clean_gens, pass_golds, filtered_idx,
         cfg, judge_system_prompt,
     )
-    # judge_answers_batch already calls release_vram internally
 
     # ── Assemble TrainingExamples ────────────────────────────────────────
     output: list[Optional[TrainingExample]] = [None] * len(items)
@@ -558,91 +562,7 @@ def run_inference_phase(
     return output
 
 
-# ---------------------------------------------------------------------------
-# Loss functions
-# ---------------------------------------------------------------------------
-def batched_log_probs(
-        model,
-        tokenizer,
-        prompts: list[str],
-        completions: list[str],
-        max_len: int,
-        no_grad: bool = False,
-) -> list[torch.Tensor]:
-    assert len(prompts) == len(completions)
-
-    encoded_full   = []
-    encoded_prompt = []
-    for p, c in zip(prompts, completions):
-        enc_f = tokenizer(
-            p + c, return_tensors="pt", truncation=True, max_length=max_len,
-            return_token_type_ids=True, add_special_tokens=False
-        )
-        enc_p = tokenizer(
-            p, return_tensors="pt", truncation=True, max_length=max_len, add_special_tokens=False
-        )
-        encoded_full.append(enc_f)
-        encoded_prompt.append(enc_p)
-
-    max_full_len = max(e["input_ids"].shape[1] for e in encoded_full)
-    pad_id       = tokenizer.pad_token_id
-    batch_size   = len(prompts)
-
-    padded_ids  = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long)
-    padded_attn = torch.zeros((batch_size, max_full_len), dtype=torch.long)
-    padded_ttids = torch.zeros((batch_size, max_full_len), dtype=torch.long)
-
-    for i, enc in enumerate(encoded_full):
-        seq_len = enc["input_ids"].shape[1]
-        padded_ids[i,   :seq_len] = enc["input_ids"].squeeze(0)
-        padded_attn[i,  :seq_len] = enc["attention_mask"].squeeze(0)
-        padded_ttids[i, :seq_len] = enc["token_type_ids"].squeeze(0)
-
-    padded_ids   = padded_ids.to(model.device)
-    padded_attn  = padded_attn.to(model.device)
-    padded_ttids = padded_ttids.to(model.device)
-
-    ctx = torch.inference_mode() if no_grad else torch.enable_grad()
-    with ctx:
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            outputs  = model(
-                input_ids=padded_ids,
-                attention_mask=padded_attn,
-                token_type_ids=padded_ttids,
-            )
-            logits = outputs.logits
-
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = padded_ids[:, 1:].contiguous().unsqueeze(-1)
-
-    del outputs, logits, padded_ids, padded_attn, padded_ttids
-
-    token_logits = shift_logits.gather(2, shift_labels).squeeze(-1)
-    log_z        = torch.logsumexp(shift_logits, dim=-1)
-    token_lp     = token_logits - log_z
-
-    del shift_logits, log_z, token_logits, shift_labels
-
-    results = []
-    for i, enc_p in enumerate(encoded_prompt):
-        # The prompt length tells us where the completion starts
-        prompt_len = enc_p["input_ids"].shape[1]
-        # The full length (prompt + completion)
-        seq_len = encoded_full[i]["input_ids"].shape[1]
-        # Shifted labels mean the prediction for the first completion token
-        # is at index [prompt_len - 1] in the shift_logits/token_lp tensor.
-        # We want to sum from the prompt end to the end of the sequence.
-
-        # Correct indexing:
-        # prompt_len - 1 is the log-prob of the FIRST token of the completion
-        # seq_len - 1 is the log-prob of the LAST token of the completion
-        completion_lp = token_lp[i, prompt_len - 1: seq_len - 1]
-
-        # DO NOT divide by length. Use the raw sum.
-        results.append(completion_lp.sum().clone())
-
-    del token_lp
-    return results
+#
 
 
 def dpo_loss_weighted_batch(
@@ -666,18 +586,17 @@ def dpo_loss_weighted_batch(
     return torch.stack(losses).mean()
 
 
-def batched_sft_loss(
+def compute_logprobs_and_sft(
         model,
         tokenizer,
         prompts: list[str],
         completions: list[str],
         max_len: int,
-) -> torch.Tensor:
-    assert len(prompts) == len(completions)
-    batch_size = len(prompts)
-
-    encoded_full   = []
-    prompt_lengths = []
+        compute_sft: bool = False,
+        no_grad: bool = False,
+):
+    # 1. Tokenize and pad
+    encoded_full, prompt_lengths, seq_lengths = [], [], []
     for p, c in zip(prompts, completions):
         enc_f = tokenizer(
             p + c, return_tensors="pt", truncation=True, max_length=max_len,
@@ -688,38 +607,65 @@ def batched_sft_loss(
         )
         encoded_full.append(enc_f)
         prompt_lengths.append(enc_p["input_ids"].shape[1])
+        seq_lengths.append(enc_f["input_ids"].shape[1])
 
-    max_full_len = max(e["input_ids"].shape[1] for e in encoded_full)
+    batch_size = len(prompts)
+    max_full_len = max(seq_lengths)
     pad_id = tokenizer.pad_token_id
 
-    padded_ids   = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long)
-    padded_attn  = torch.zeros((batch_size, max_full_len), dtype=torch.long)
+    padded_ids = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long, device=model.device)
+    padded_attn = torch.zeros((batch_size, max_full_len), dtype=torch.long, device=model.device)
     padded_ttids = torch.zeros((batch_size, max_full_len), dtype=torch.long)
-    labels       = torch.full((batch_size, max_full_len), -100, dtype=torch.long)
 
-    for i, (enc, p_len) in enumerate(zip(encoded_full, prompt_lengths)):
-        seq_len = enc["input_ids"].shape[1]
-        padded_ids[i,   :seq_len] = enc["input_ids"].squeeze(0)
-        padded_attn[i,  :seq_len] = enc["attention_mask"].squeeze(0)
-        padded_ttids[i, :seq_len] = enc["token_type_ids"].squeeze(0)
-        labels[i, p_len:seq_len]  = enc["input_ids"].squeeze(0)[p_len:]
+    for i, enc in enumerate(encoded_full):
+        s_len = seq_lengths[i]
+        padded_ids[i, :s_len] = enc["input_ids"].squeeze(0)
+        padded_attn[i, :s_len] = enc["attention_mask"].squeeze(0)
+        padded_ttids[i, :s_len] = enc["token_type_ids"].squeeze(0)
 
-    padded_ids   = padded_ids.to(model.device)
-    padded_attn  = padded_attn.to(model.device)
-    padded_ttids = padded_ttids.to(model.device)
-    labels       = labels.to(model.device)
+    # 2. Forward pass
+    ctx = torch.inference_mode() if no_grad else torch.enable_grad()
+    with ctx, torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        outputs = model(input_ids=padded_ids, attention_mask=padded_attn, token_type_ids=padded_ttids,)
 
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        loss = model(
-            input_ids=padded_ids,
-            attention_mask=padded_attn,
-            token_type_ids=padded_ttids,
-            labels=labels,
-        ).loss
+    shift_logits = outputs.logits[:, :-1, :].contiguous()
+    shift_labels = padded_ids[:, 1:].contiguous()
 
-    del padded_ids, padded_attn, padded_ttids, labels
-    return loss
+    # 3. Memory efficient cross entropy (avoids logsumexp OOM)
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+    ce_loss = loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1)
+    )
+    ce_loss = ce_loss.view(batch_size, -1)  # Shape: [batch, seq_len - 1]
 
+    # logprob is just negative cross-entropy
+    token_lp = -ce_loss
+
+    results_lp = []
+    sft_loss_total = 0.0
+    sft_tokens = 0
+
+    # 4. Extract completion logprobs
+    for i, p_len in enumerate(prompt_lengths):
+        s_len = seq_lengths[i]
+        # Completion starts at p_len (in shifted labels it is p_len - 1)
+        completion_logprobs = token_lp[i, p_len - 1: s_len - 1]
+        results_lp.append(completion_logprobs.sum())
+
+        if compute_sft:
+            sft_loss_total -= completion_logprobs.sum()  # accumulate positive loss
+            sft_tokens += completion_logprobs.numel()
+
+    sft_loss = (sft_loss_total / sft_tokens) if (compute_sft and sft_tokens > 0) else None
+
+    # Force cleanup of massive graph roots
+    del outputs, shift_logits, shift_labels, padded_ids, padded_attn, ce_loss, token_lp
+
+    if no_grad:
+        results_lp = [lp.detach() for lp in results_lp]
+
+    return results_lp, sft_loss
 
 # ---------------------------------------------------------------------------
 # Training phase: consume a list of TrainingExamples in sub-batches
@@ -759,24 +705,19 @@ def run_training_phase(
         chosen_completions   = [ex.chosen_completion   for ex in sub_batch]
         rejected_completions = [ex.rejected_completion for ex in sub_batch]
         reward_weights       = [ex.reward_weight       for ex in sub_batch]
-        judge_prompts        = [ex.judge_prompt        for ex in sub_batch]
-        judge_responses      = [ex.judge_response      for ex in sub_batch]
+        #judge_prompts        = [ex.judge_prompt        for ex in sub_batch]
+        #judge_responses      = [ex.judge_response      for ex in sub_batch]
 
         # ── Ref log-probs (no grad, ref adapter) ──────────────────────
         model.set_adapter("ref")
         model.eval()
-        ref_lps = batched_log_probs(
-            model, tokenizer,
-            dpo_prompts + dpo_prompts,
-            chosen_completions + rejected_completions,
-            cfg.max_seq_len, no_grad=True,
+
+        ref_lp_chosen, _ = compute_logprobs_and_sft(
+            model, tokenizer, dpo_prompts, chosen_completions, cfg.max_seq_len, compute_sft=False, no_grad=True
         )
-        # Detach explicitly: even though no_grad=True, severing the tensor
-        # from any autograd state ensures nothing from the ref forward pass
-        # lingers in memory during the policy forward pass.
-        ref_lp_chosen   = [t.detach() for t in ref_lps[:n]]
-        ref_lp_rejected = [t.detach() for t in ref_lps[n:]]
-        del ref_lps
+        ref_lp_rejected, _ = compute_logprobs_and_sft(
+            model, tokenizer, dpo_prompts, rejected_completions, cfg.max_seq_len, compute_sft=False, no_grad=True
+        )
 
         release_vram(f"sub-batch {sb_idx + 1} ref logprobs")
 
@@ -784,32 +725,28 @@ def run_training_phase(
         model.set_adapter("default")
         model.train()
 
-        pol_lps = batched_log_probs(
-            model, tokenizer,
-            dpo_prompts + dpo_prompts,
-            chosen_completions + rejected_completions,
-            cfg.max_seq_len, no_grad=False,
+        # 1. Forward chosen (Computes BOTH chosen logprobs AND SFT loss at the same time!)
+        pol_lp_chosen, loss_sft = compute_logprobs_and_sft(
+            model, tokenizer, dpo_prompts, chosen_completions, cfg.max_seq_len, compute_sft=True, no_grad=False
         )
-        pol_lp_chosen   = pol_lps[:n]
-        pol_lp_rejected = pol_lps[n:]
-        del pol_lps
 
+        # 2. Forward rejected
+        pol_lp_rejected, _ = compute_logprobs_and_sft(
+            model, tokenizer, dpo_prompts, rejected_completions, cfg.max_seq_len, compute_sft=False, no_grad=False
+        )
+
+        # 3. Calculate DPO margin
         loss_dpo = dpo_loss_weighted_batch(
-            ref_lp_chosen,   ref_lp_rejected,
-            pol_lp_chosen,   pol_lp_rejected,
+            ref_lp_chosen, ref_lp_rejected,
+            pol_lp_chosen, pol_lp_rejected,
             beta=cfg.dpo_beta,
             reward_weights=reward_weights,
         )
 
-        loss_sft = batched_sft_loss(
-            model, tokenizer,
-            dpo_prompts, chosen_completions, cfg.max_seq_len,
-        )
-
-        print('--------------Chosen completion-------------------------')
-        print("prompts", dpo_prompts)
-        print('\n\n\ Completions', chosen_completions)
-
+        #print('--------------Chosen completion-------------------------')
+        #print("prompts", dpo_prompts)
+        #print('\n\n\ Completions', chosen_completions)
+        # 4. Combine and Backpropagate
         loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
         (loss / cfg.grad_accumulation_steps).backward()
 
@@ -971,12 +908,12 @@ def main(cfg: FrameworkConfig):
 if __name__ == "__main__":
     cfg = FrameworkConfig(
         model_name="google/gemma-3-12b-it",
-        data_path="data/nemotron_sft_all_final_98k.json",
+        data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
         num_epochs=1,
-        load_in_4bit=True,
-        inference_batch_size=8,   # generate + judge 16 at a time
+        load_in_4bit=False,
+        inference_batch_size=32,   # generate + judge 16 at a time
         batch_size=2,              # train 4 at a time
-        output_dir="./checkpoints",
+        output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
     )
     main(cfg)
