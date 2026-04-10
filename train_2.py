@@ -62,8 +62,8 @@ class FrameworkConfig:
     dpo_beta: float = 0.1
     learning_rate: float = 5e-5
     num_epochs: int = 1
-    inference_batch_size: int = 32   # large batch for generation + judging
-    max_judge_batch_size: int = 8
+    inference_batch_size: int = 32   # large batch for generation
+    max_judge_batch_size: int = 8 # max batch size for judging
     batch_size: int = 4              # smaller sub-batch for SFT + DPO training
     grad_accumulation_steps: int = 1
     warmup_steps: int = 50
@@ -296,67 +296,84 @@ def judge_answers_batch(
         filtered_idx: list[int],
         cfg: FrameworkConfig,
         judge_system_prompt: str,
+        max_judge_batch_size: int = 4,
 ) -> list[tuple[dict, dict]]:
-    orderings = []
-    for gen, gold in zip(generated_answers, gold_answers):
-        if random.randint(0, 1) == 0:
-            orderings.append((gen, gold, "ANSWER 1", "ANSWER 2"))
-        else:
-            orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
+    num_examples = len(questions)
+    results = [None] * num_examples  # Pre-allocate to maintain order
+    filtered_set = set(filtered_idx)
 
-    prompts = []
-    for q, (a1, a2, _, _) in zip(questions, orderings):
-        user_content = (
-            f"QUESTION:\n{q}\n\n"
-            f"ANSWER 1:\n{a1}\n\n"
-            f"ANSWER 2:\n{a2}"
+    # 1. Immediately handle auto-scored examples
+    for idx in filtered_idx:
+        results[idx] = (
+            {k: 1 for k in cfg.judge_criteria},
+            {k: 5 for k in cfg.judge_criteria}
         )
-        prompts.append(
+
+    # 2. Identify indices that actually need the LLM
+    indices_to_judge = [i for i in range(num_examples) if i not in filtered_set]
+
+    if not indices_to_judge:
+        return results
+
+    # 3. Process only the required indices in chunks
+    for start_ptr in range(0, len(indices_to_judge), max_judge_batch_size):
+        end_ptr = min(start_ptr + max_judge_batch_size, len(indices_to_judge))
+        current_batch_indices = indices_to_judge[start_ptr:end_ptr]
+
+        # Gather only the necessary data for this chunk
+        chunk_questions = [questions[i] for i in current_batch_indices]
+        chunk_gen = [generated_answers[i] for i in current_batch_indices]
+        chunk_gold = [gold_answers[i] for i in current_batch_indices]
+
+        # Handle Random Ordering
+        chunk_orderings = []
+        for gen, gold in zip(chunk_gen, chunk_gold):
+            if random.randint(0, 1) == 0:
+                chunk_orderings.append((gen, gold, "ANSWER 1", "ANSWER 2"))
+            else:
+                chunk_orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
+
+        # Build Prompts
+        chunk_prompts = [
             tokenizer.apply_chat_template(
                 [{"role": "system", "content": judge_system_prompt},
-                 {"role": "user", "content": user_content}],
+                 {"role": "user", "content": f"QUESTION:\n{q}\n\nANSWER 1:\n{a1}\n\nANSWER 2:\n{a2}"}],
                 tokenize=False, add_generation_prompt=True,
+            ) for q, (a1, a2, _, _) in zip(chunk_questions, chunk_orderings)
+        ]
+
+        # Inference
+        with left_padding(tokenizer):
+            inputs = tokenizer(
+                chunk_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                add_special_tokens=False,
+                max_length=cfg.max_seq_len,
+            ).to(model.device)
+
+        input_length = inputs["input_ids"].shape[1]
+
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=128,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
             )
-        )
 
-    with left_padding(tokenizer):
-        inputs = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            add_special_tokens=False,
-            max_length=cfg.max_seq_len,
-        ).to(model.device)
+        generated_tokens = output_ids[:, input_length:]
+        del inputs
+        release_vram("post-judge inputs chunk")
 
-    input_length = inputs["input_ids"].shape[1]
+        # 4. Parse and place back into the correct global position
+        for i, global_idx in enumerate(current_batch_indices):
+            _, _, generated_key, gs_key = chunk_orderings[i]
+            raw = tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
 
-    with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_new_tokens=256,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-
-    generated_tokens = output_ids[:, input_length:]
-
-    del inputs
-    release_vram("post-judge inputs")
-
-    results = []
-    for i, (_, _, generated_key, gs_key) in enumerate(orderings):
-        new_ids = generated_tokens[i]
-        raw = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-        if i in filtered_idx:
-            print(f"Filtered out (using 1 vs 5) for idx:", i)
-            results.append(
-                ({k: 1 for k in cfg.judge_criteria},
-                 {k: 5 for k in cfg.judge_criteria})
-            )
-        else:
             try:
                 print('----------------------------JUDGE------------------------------')
                 print(raw)
@@ -365,21 +382,23 @@ def judge_answers_batch(
                 scores = json.loads(cleaned)
                 scores_generated = scores[generated_key]
                 scores_gs = scores[gs_key]
+
                 for k in cfg.judge_criteria:
                     scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
                     scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
-                results.append((scores_generated, scores_gs))
+
+                results[global_idx] = (scores_generated, scores_gs)
             except (json.JSONDecodeError, KeyError, ValueError):
-                print(f"[Judge ] Parse failed — using fallback (1 vs 5).")
-                results.append(
-                    ({k: 1 for k in cfg.judge_criteria},
-                     {k: 5 for k in cfg.judge_criteria})
+                print(f"[Judge ] Parse failed for idx {global_idx} — using fallback.")
+                results[global_idx] = (
+                    {k: 1 for k in cfg.judge_criteria},
+                    {k: 5 for k in cfg.judge_criteria}
                 )
 
-    del output_ids
-    release_vram("post-judge outputs")
-    return results
+        del output_ids
+        release_vram(f"post-judge chunk complete")
 
+    return results
 
 def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
     vals = [scores.get(k, 3) for k in cfg.judge_criteria]
@@ -498,12 +517,12 @@ def run_inference_phase(
     pass_golds      = [g for g in golds]
 
     # ── Phase 3: judging ─────────────────────────────────────────────────
-    print(f"[Inference] Judging {len(pass_questions)} surviving answers …")
+    print(f"[Inference] Judging {len(pass_questions) - len(filtered_idx)} surviving answers …")
     # Still uses "default" adapter / eval mode from generation phase
     judge_results = judge_answers_batch(
         model, tokenizer,
         pass_questions, pass_clean_gens, pass_golds, filtered_idx,
-        cfg, judge_system_prompt,
+        cfg, judge_system_prompt
     )
 
     # ── Assemble TrainingExamples ────────────────────────────────────────
@@ -527,7 +546,7 @@ def run_inference_phase(
 
         dpo_prompt = build_dpo_prompt(questions[orig_idx], tokenizer)
 
-        if base_weight_gen >= base_weight_gs:
+        if base_weight_gen > base_weight_gs:
             chosen_completion   = generated_raw[orig_idx]
             rejected_completion = golds[orig_idx]
         else:
@@ -911,7 +930,8 @@ if __name__ == "__main__":
         data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
         num_epochs=1,
         load_in_4bit=False,
-        inference_batch_size=32,   # generate + judge 16 at a time
+        inference_batch_size=32, #generate batch
+        max_judge_batch_size=8,#judge batch at a time
         batch_size=2,              # train 4 at a time
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
