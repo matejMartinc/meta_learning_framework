@@ -5,13 +5,14 @@ import google.generativeai as genai
 from typing import List, Dict
 
 # --- Configuration ---
-GOOGLE_API_KEY = "AIzaSyDi7tgviCaISK7T0rySR6TX56rE0v0gg9s"
+GOOGLE_API_KEY = "AIzaSyAH1J-rv7EBsBmy2RMFgCHKryrbBa3RWSE"
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # List of your model result files (JSONL format)
 MODEL_RESULT_FILES = [
     "results/gemma-3-12b-it_meta_improved_predictions.jsonl",
     "results/gemma-3-12b-it_sft_predictions.jsonl",
+    "results/gemma-3-12b-it_base_predictions.jsonl"
 ]
 
 OUTPUT_FILE = "LLM_as_a_judge_scores.jsonl"

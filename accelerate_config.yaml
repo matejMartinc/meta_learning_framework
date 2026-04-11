@@ -1,0 +1,7 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+num_processes: 4  # <-- Set this to your actual number of GPUs
+deepspeed_config:
+  deepspeed_config_file: deepspeed_config.json
+  zero3_init_flag: false
+

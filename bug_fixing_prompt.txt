@@ -1,552 +1,787 @@
-I have this code for my new meta learning framework. The basic idea is that before model training on the specific example, we ask the model to check the example for errors and fix it if needed. If the fix is good (based on the perpleyity measure and alignment with the validation gradient), we do SFt fine tuning on the corrected example instead of on the original example. Additonally, model gets rewards for finding mistakes, correctly fixing the mistake, etc.
-During training however I always run into an issue, the model eventually converges into the path with the least resistance:
+I have this code for my new online learning framework. The basic idea is that before model training on the specific example answer,
+we ask the model to answer it on itself, compare (judge) its answer and the gold standard answer and then train using (dpo and sft) based on the scores given.
 
-This is my train script:
-
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-import torch.nn.functional as F
-from sentence_transformers import SentenceTransformer
 import json
-import random
-import numpy as np
-from torch.optim import Adam
-import gc
 import os
-import copy
-
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
-# Global stats for normalization
-ppl_stats = {"mean": 0.0, "var": 1.0, "n": 0}
-align_stats = {"mean": 0.0, "var": 1.0, "n": 0}
-
-
-# ── Gradient utilities ────────────────────────────────────────────────────────
-
-def update_and_normalize(value, stats, eps=1e-8):
-    stats["n"] += 1
-    delta = value - stats["mean"]
-    stats["mean"] += delta / stats["n"]
-    stats["var"] += (delta * (value - stats["mean"]) - stats["var"]) / stats["n"]
-    std = max(stats["var"] ** 0.5, eps)
-    return np.tanh(value / std)
-
-
-def get_lora_parameters(model):
-    return [p for name, p in model.named_parameters() if "lora_" in name and p.requires_grad]
-
-
-def compute_gradient_vector(model, batch_encoding, lora_params):
-    was_training = model.training
-    model.train()
-    model.zero_grad()
-
-    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-        output = model(**batch_encoding)
-        loss = output.loss
-
-    loss_val = loss.item()
-    if not np.isfinite(loss_val):
-        model.zero_grad()
-        if not was_training: model.eval()
-        torch.cuda.empty_cache()
-        total_params = sum(p.numel() for p in lora_params)
-        return torch.zeros(total_params), loss_val
-
-    loss.backward()
-    del output, loss
-
-    grads = []
-    for p in lora_params:
-        g = p.grad.detach().float().view(-1).cpu() if p.grad is not None else torch.zeros(p.numel())
-        grads.append(g)
-
-    model.zero_grad()
-    for p in lora_params: p.grad = None
-    if not was_training: model.eval()
-    torch.cuda.empty_cache()
-    return torch.cat(grads), loss_val
-
-
-# ── Retrieval ─────────────────────────────────────────────────────────────────
-
-def retrieve_similar_val_examples(batch_texts, val_examples, val_embeddings, k, embedder):
-    batch_embeddings = embedder.encode(batch_texts, convert_to_tensor=True)
-    sims = F.cosine_similarity(batch_embeddings.unsqueeze(1), val_embeddings.unsqueeze(0), dim=-1)
-    topk_indices = sims.topk(k, dim=-1).indices
-    unique_indices = torch.unique(topk_indices)
-    return [val_examples[i] for i in unique_indices.cpu().tolist()]
-
-
-# ── Tokenisation helpers ──────────────────────────────────────────────────────
-
-def to_ids_list(result):
-    # Scalar int (single token)
-    if isinstance(result, int):
-        return [result]
-    # Already a flat list of ints
-    if isinstance(result, list):
-        if len(result) > 0 and isinstance(result[0], int):
-            return result
-        # Nested list — unwrap one level
-        if len(result) > 0 and isinstance(result[0], list):
-            return result[0]
-        return result
-    # HuggingFace BatchEncoding or similar
-    if hasattr(result, 'input_ids'):
-        ids = result.input_ids
-        if hasattr(ids, 'tolist'):
-            return ids[0].tolist() if ids.dim() > 1 else ids.tolist()
-        return list(ids[0]) if hasattr(ids[0], '__iter__') else list(ids)
-    # Tensor
-    if hasattr(result, 'tolist'):
-        t = result.tolist()
-        return t[0] if isinstance(t, list) and len(t) > 0 and isinstance(t[0], list) else t
-    return list(result)
-
-
-def encode_examples_for_model(examples, tokenizer, device, max_length=1024):
-    all_input_ids, all_attention_masks, all_labels = [], [], []
-
-    for ex in examples:
-        turns = ex['conversations']
-        user_turn = turns[0].get('value') or turns[0].get('content', '')
-        assistant_turn = turns[1].get('value') or turns[1].get('content', '')
-
-        prompt_messages = [{"role": "user", "content": user_turn}]
-        full_messages = [{"role": "user", "content": user_turn}, {"role": "assistant", "content": assistant_turn}]
-
-        prompt_ids = to_ids_list(tokenizer.apply_chat_template(
-            prompt_messages, add_generation_prompt=True, tokenize=True, truncation=True, max_length=max_length
-        ))
-        full_ids = to_ids_list(tokenizer.apply_chat_template(
-            full_messages, add_generation_prompt=False, tokenize=True, truncation=True, max_length=max_length
-        ))
-
-        prompt_len = min(len(prompt_ids), len(full_ids))
-
-        all_input_ids.append(full_ids)
-        all_attention_masks.append([1] * len(full_ids))
-        all_labels.append([-100] * prompt_len + full_ids[prompt_len:])
-
-    max_len = max(len(x) for x in all_input_ids)
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-    def pad_right(seq, pad_val): return seq + [pad_val] * (max_len - len(seq))
-
-    input_ids = torch.tensor([pad_right(x, pad_id) for x in all_input_ids]).to(device)
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": torch.tensor([pad_right(x, 0) for x in all_attention_masks]).to(device),
-        "labels": torch.tensor([pad_right(x, -100) for x in all_labels]).to(device),
-        "token_type_ids": torch.zeros_like(input_ids).to(device)
-    }
-
-
-def make_fixed_conversation(original_item, fixed_assistant_text):
-    item = copy.deepcopy(original_item)
-    turns = item["conversations"]
-    for turn in reversed(turns):
-        role = turn.get("from", turn.get("role", ""))
-        if role in ("gpt", "assistant"):
-            key = "value" if "value" in turn else "content"
-            turn[key] = fixed_assistant_text
-            break
-    return item
-
-
-# ── Reward computation ────────────────────────────────────────────────────────
-
-def compute_perplexity(model, tokenizer, item, device):
-    encoding = encode_examples_for_model([item], tokenizer, device)
-    with torch.no_grad():
-        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            output = model(**encoding)
-    return output.loss.item()
-
-
-def compute_rewards_and_decide_action(
-        model, tokenizer, batch_texts, batch_items, responses,
-        val_examples, val_embeddings, embedder, device, k=5,
-):
-    lora_params = get_lora_parameters(model)
-    similar_val = retrieve_similar_val_examples(batch_texts, val_examples, val_embeddings, k, embedder)
-    val_encoding = encode_examples_for_model(similar_val, tokenizer, device)
-
-    with torch.enable_grad():
-        val_grad, _ = compute_gradient_vector(model, val_encoding, lora_params)
-    del val_encoding
-    torch.cuda.empty_cache()
-
-    actions = []
-    # actions structure: list of dicts:
-    # {'action': 'SFT'|'DPO'|'SKIP', 'item': orig_item, 'fixed_text': str, 'auditor_response': str}
-
-    for i, (resp, orig_text) in enumerate(zip(responses, batch_texts)):
-        try:
-            cleaned = resp.replace("```json", "").replace("```", "").strip()
-            data = json.loads(cleaned)
-
-            status = data.get("status", "DIRTY").upper()
-            fixed_text = data.get("fixed_text", orig_text)
-            diag = data.get("diagnosis", "N/A")
-            item_id = batch_items[i]['id']
-            old_conversation = batch_items[i]['conversations']
-            fixed_conversation = make_fixed_conversation(batch_items[i], fixed_text)['conversations']
-            print("Status:", status)
-
-            if status != "CLEAN":
-                print('***********************DIRTY*****************')
-                print('Item id', item_id)
-                print("Fixed text:", fixed_text)
-                print('\n\nOriginal text:', orig_text)
-
-
-            # --- Check Alignment of Original ---
-            orig_encoding = encode_examples_for_model([batch_items[i]], tokenizer, device)
-            with torch.enable_grad():
-                orig_grad, _ = compute_gradient_vector(model, orig_encoding, lora_params)
-            del orig_encoding
-
-            orig_alignment = F.cosine_similarity(orig_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
-            del orig_grad
-
-            if status == "CLEAN":
-                actions.append({
-                    'action': 'SFT_CLEAN',
-                    'item': batch_items[i],
-                    'auditor_response': resp
-                })
-            else:
-                # --- Dirty: Evaluate Fix ---
-                fixed_item = make_fixed_conversation(batch_items[i], fixed_text)
-                fixed_encoding = encode_examples_for_model([fixed_item], tokenizer, device)
-                with torch.enable_grad():
-                    fixed_grad, _ = compute_gradient_vector(model, fixed_encoding, lora_params)
-                del fixed_encoding
-
-                fixed_alignment = F.cosine_similarity(fixed_grad.unsqueeze(0), val_grad.unsqueeze(0)).item()
-                del fixed_grad
-
-                # Check Faithfulness (Semantic Similarity)
-                with torch.no_grad():
-                    orig_emb = embedder.encode(orig_text, convert_to_tensor=True).cpu()
-                    fixed_emb = embedder.encode(fixed_text, convert_to_tensor=True).cpu()
-                    semantic_sim = F.cosine_similarity(orig_emb.unsqueeze(0), fixed_emb.unsqueeze(0)).item()
-
-                faithfulness_gate = 1.0 if semantic_sim > 0.8 else 0.1
-
-                # Check PPL improvement
-                orig_ppl = compute_perplexity(model, tokenizer, batch_items[i], device)
-                fixed_ppl = compute_perplexity(model, tokenizer, fixed_item, device)
-
-                # Composite Score
-                alignment_delta = update_and_normalize(fixed_alignment - orig_alignment, align_stats)
-                ppl_delta = update_and_normalize(orig_ppl - fixed_ppl,
-                                                 ppl_stats)  # higher orig ppl (bad) - lower fixed ppl (good) = positive
-
-                score = 0.5 * alignment_delta + 0.5 * ppl_delta
-
-                print(f"Fix Score: {score:.3f} | Faithful: {semantic_sim:.2f}")
-                fix_worked = False
-                if score > 0 and faithfulness_gate == 1.0:
-                    fix_worked = True
-                    print("Successful FIX! Scheduling DPO.")
-                    actions.append({
-                        'action': 'DPO_FIX',
-                        'item': batch_items[i],
-                        'fixed_text': fixed_text,
-                        'auditor_response': resp
-                    })
-                else:
-                    print("Failed FIX. Skipping.")
-                    actions.append({'action': 'SKIP'})
-
-                log_refined_data(item_id, status, diag, fixed_conversation, old_conversation, fix_worked)
-
-        except Exception as e:
-            print(f"JSON Error: {e}")
-            actions.append({'action': 'SKIP'})
-
-    del val_grad
-    torch.cuda.empty_cache()
-    return actions
-
-
-# ── Optimization Step (DPO + SFT) ─────────────────────────────────────────────
-
-def get_batch_logps(logits, labels, label_pad_token_id=-100):
-    """Compute log probabilities for DPO"""
-    if logits.shape[:-1] != labels.shape:
-        raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
-
-    labels = labels[:, 1:].clone()
-    logits = logits[:, :-1, :]
-    loss_mask = labels != label_pad_token_id
-
-    # dummy token; we'll zero out loss later
-    labels[labels == label_pad_token_id] = 0
-
-    per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
-    return (per_token_logps * loss_mask).sum(-1)
-
-
-
-def hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device, beta=0.1):
-    """
-    Handles:
-    1. SFT on Auditor Output (To keep model speaking JSON)
-    2. SFT on Clean Conversation
-    3. DPO on Fixed vs Original Conversation
-    """
-    model.train()
-    total_loss = torch.tensor(0.0, device=device)
-    valid_batch = False
-
-    for action_data, prompt_text in zip(actions, prompts):
-        action_type = action_data['action']
-
-        if action_type == 'SKIP':
-            continue
-
-        valid_batch = True
-
-        # ── 1. AUDITOR MAINTENANCE (Crucial for preventing JSON collapse) ──
-        # We SFT on the prompt + the VALID auditor response (JSON)
-        auditor_resp = action_data.get('auditor_response', '')
-        if auditor_resp:
-            auditor_text = prompt_text + auditor_resp
-            # Basic tokenization for SFT
-            auditor_enc = tokenizer(auditor_text, return_tensors='pt', truncation=True, max_length=1024).to(device)
-            # Mask the prompt part for loss
-            prompt_enc = tokenizer(prompt_text, return_tensors='pt', add_special_tokens=False)
-            labels = auditor_enc.input_ids.clone()
-            labels[:, :prompt_enc.input_ids.shape[1]] = -100
-            # Ensure token_type_ids is present if the tokenizer didn't automatically generate it
-            if "token_type_ids" not in auditor_enc:
-                auditor_enc["token_type_ids"] = torch.zeros_like(auditor_enc.input_ids)
-
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                auditor_out = model(**auditor_enc, labels=labels)
-
-            # Weighted less so it doesn't dominate, but keeps the JSON format alive
-            total_loss += 0.8 * auditor_out.loss
-            if action_type == 'SFT_AUDITOR_ONLY':
-                print("Auditor response:", auditor_resp, "Total loss", total_loss)
-            del auditor_enc, auditor_out
-
-        # ── 2. CONVERSATIONAL OPTIMIZATION ──
-        if action_type == 'SFT_CLEAN':
-            # Standard SFT on the conversation
-            item = action_data['item']
-            sft_encoding = encode_examples_for_model([item], tokenizer, device)
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                sft_out = model(**sft_encoding)
-            total_loss += sft_out.loss
-            del sft_encoding, sft_out
-
-        elif action_type == 'DPO_FIX':
-            # DPO: Chosen (Fixed) vs Rejected (Original)
-            item = action_data['item']
-            fixed_text = action_data['fixed_text']
-
-            item_fixed = make_fixed_conversation(item, fixed_text)
-
-            # Prepare inputs
-            enc_chosen = encode_examples_for_model([item_fixed], tokenizer, device)
-            enc_rejected = encode_examples_for_model([item], tokenizer, device)
-
-            # Get Policy Logprobs
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out_chosen = model(**enc_chosen)
-                out_rejected = model(**enc_rejected)
-
-            logps_chosen = get_batch_logps(out_chosen.logits, enc_chosen['labels'])
-            logps_rejected = get_batch_logps(out_rejected.logits, enc_rejected['labels'])
-
-            # Get Reference Logprobs (Using disabled adapters to act as Ref model)
-            with torch.no_grad():
-                with model.disable_adapter():
-                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        ref_out_chosen = model(**enc_chosen)
-                        ref_out_rejected = model(**enc_rejected)
-
-            ref_logps_chosen = get_batch_logps(ref_out_chosen.logits, enc_chosen['labels'])
-            ref_logps_rejected = get_batch_logps(ref_out_rejected.logits, enc_rejected['labels'])
-
-            # DPO Loss Calculation
-            pi_logratios = logps_chosen - logps_rejected
-            ref_logratios = ref_logps_chosen - ref_logps_rejected
-
-            logits = pi_logratios - ref_logratios
-            dpo_loss = -F.logsigmoid(beta * logits).mean()
-
-            total_loss += dpo_loss
-
-            del enc_chosen, enc_rejected, out_chosen, out_rejected
-
-    if valid_batch:
-        optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(get_lora_parameters(model), max_norm=1.0)
-        optimizer.step()
-        return total_loss.item()
-    else:
-        return 0.0
-
-# ── Generation ────────────────────────────────────────────────────────────────
-
-def generate_responses(model, tokenizer, prompts, device, max_new_tokens=1024):
-    model.eval()
-    responses = []
-    with torch.no_grad():
-        for prompt in prompts:
-            encoding = tokenizer(prompt, return_tensors="pt", return_attention_mask=True, max_length=1024,
-                                 add_special_tokens=False).to(device)
-            output = model.generate(
-                input_ids=encoding.input_ids,
-                attention_mask=encoding.attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.7,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            resp_ids = output[0][encoding.input_ids.shape[1]:]
-            responses.append(tokenizer.decode(resp_ids, skip_special_tokens=True))
-            del output, encoding
-    model.train()
-    return responses
-
-
-# ── Training loop ─────────────────────────────────────────────────────────────
-
-def train(dataset, val_examples, val_embeddings):
-    print("Starting Hybrid SFT/DPO Training...")
-
-    for i in range(0, len(dataset), batch_size):
-        batch = dataset[i: i + batch_size]
-        raw_texts = [item["conversations"][1].get("value", item["conversations"][1].get("content", "")) for item in
-                     batch]
-
-        # Auditor Prompt
-        prompts = []
-        for conv in raw_texts:
-            messages = [{
-                "role": "user",
-                "content": (
-                    f'''Your primary goal is to audit Slovenian text and identify and correct all morphosyntactic errors, specifically noun-adjective gender/number agreement and wrong case endings, which must be treated as critical errors.
-                    Rules:
-                    1. Reasoning: Briefly describe any errors found.
-                    2. If grammatical errors exist, return {{"status": "DIRTY", "fixed_text": "...", "diagnosis": "..."}}
-                    3. If perfect, return {{"status": "CLEAN"}}
-                    4. Return ONLY valid JSON.
-                    Text: \n "{conv}"'''
-                ),
-            }]
-            prompts.append(tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False))
-
-        # 1. Generate Auditor Feedback
-        responses = generate_responses(model, tokenizer, prompts, device)
-
-        # 2. Decide what to do (SFT Clean, DPO Fix, or Skip)
-        actions = compute_rewards_and_decide_action(
-            model=model, tokenizer=tokenizer,
-            batch_texts=raw_texts, batch_items=batch, responses=responses,
-            val_examples=val_examples, val_embeddings=val_embeddings, embedder=embedder,
-            device=device, k=5
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"import randomimport reimport torchimport torch.nn.functional as Ffrom contextlib import contextmanagerfrom dataclasses import dataclass, fieldfrom typing import Optional
+from transformers import (
+AutoTokenizer,
+AutoModelForCausalLM,
+BitsAndBytesConfig,
+get_cosine_with_hard_restarts_schedule_with_warmup,
+)from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_trainingfrom sentence_transformers import SentenceTransformerfrom sklearn.metrics.pairwise import cosine_similarityfrom torch.optim import AdamWfrom langdetect import detect
+---------------------------------------------------------------------------# Configuration# ---------------------------------------------------------------------------
+
+@dataclassclass FrameworkConfig:
+# Model model_name: str = "google/gemma-3-12b-it"
+load_in_4bit: bool = True
+# LoRA lora_r: int = 16
+lora_alpha: int = 32
+lora_dropout: float = 0.05
+lora_target_modules: list = field(
+default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj",
+"gate_proj", "up_proj", "down_proj"]
+)
+
+# Data    data_path: str = "data/gams_ft_dataset.json"
+max_seq_len: int = (2 * 1024) + 256
+
+# Semantic guardrail    semantic_model_name: str = "all-MiniLM-L6-v2"
+min_cosine_similarity: float = 0.35
+
+# Judge criteria — drives the dynamic system prompt    judge_criteria: list = field(default_factory=lambda: [
+    "grammar",
+    "semantics",
+    "flow",
+    "completeness",
+    "clarity",
+])
+
+# Training    dpo_beta: float = 0.1
+learning_rate: float = 5e-5
+num_epochs: int = 1
+inference_batch_size: int = 32   # large batch for generation    max_judge_batch_size: int = 8 # max batch size for judging    batch_size: int = 4              # smaller sub-batch for SFT + DPO training    grad_accumulation_steps: int = 1
+warmup_steps: int = 50
+cosine_cycle_steps: int = 200
+sft_loss_weight: float = 0.4
+output_dir: str = "./checkpoints"
+
+ref_update_interval: int = 100
+
+# Generation    max_new_tokens: int = 1024
+temperature: float = 0.7
+top_p: float = 0.9
+
+---------------------------------------------------------------------------# Special tokens# ---------------------------------------------------------------------------
+---------------------------------------------------------------------------# Dynamic judge system prompt# ---------------------------------------------------------------------------def build_judge_system_prompt(criteria: list[str]) -> str:
+
+criteria_lines = "\n".join(
+    f"{i + 1}. {c:<14} – {_criterion_description(c)}"
+    for i, c in enumerate(criteria)
+)
+criteria_keys = ", ".join(f'"{}": <1-5>' for c in criteria)
+return f"""\
+
+You are a strict but fair language judge. You will be given:
+
+    A QUESTION
+    ANSWER 1
+    ANSWER 2
+
+Your task is to score BOTH ANSWERS on these {len(criteria)} criteria (score 1–5, where 5 is best):{}
+
+Return ONLY a valid JSON object with exactly this structure:
+{{
+"ANSWER 1": {{{}}},
+"ANSWER 2": {{{}}}
+}}
+
+Do NOT add any explanation, markdown, or extra text."""
+
+def _criterion_description(name: str) -> str:
+return {
+"grammar": "grammatical and linguistic correctness",
+"semantics": "semantic accuracy and factual correctness",
+"flow": "readability, coherence, and logical flow",
+"completeness": "how thoroughly the answer covers the topic",
+"clarity": "simplicity and clarity of explanation",
+}.get(name, name)
+---------------------------------------------------------------------------# Model loading# ---------------------------------------------------------------------------def _build_bnb_config(cfg: FrameworkConfig) -> Optional[BitsAndBytesConfig]:
+
+if not cfg.load_in_4bit:
+    return None    return BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)
+
+def _build_lora_config(cfg: FrameworkConfig) -> LoraConfig:
+return LoraConfig(
+task_type=TaskType.CAUSAL_LM,
+r=cfg.lora_r,
+lora_alpha=cfg.lora_alpha,
+lora_dropout=cfg.lora_dropout,
+target_modules=cfg.lora_target_modules,
+bias="none",
+)
+
+def load_model_and_tokenizer(cfg: FrameworkConfig):
+tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+tokenizer.padding_side = "right"
+if tokenizer.pad_token is None:
+tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    cfg.model_name,
+    quantization_config=_build_bnb_config(cfg),
+    device_map="auto",
+    torch_dtype=torch.bfloat16 if not cfg.load_in_4bit else None,
+    attn_implementation="flash_attention_2"
+)
+
+if cfg.load_in_4bit:
+    model = prepare_model_for_kbit_training(model)
+
+lora_config = _build_lora_config(cfg)
+model = get_peft_model(model, lora_config, adapter_name="default")
+model.add_adapter("ref", lora_config)
+
+for name, param in model.named_parameters():
+    if "ref" in name:
+        param.requires_grad_(False)
+
+model.print_trainable_parameters()
+return model, tokenizer
+
+def sync_ref_model(model) -> None:
+copied = 0
+with torch.no_grad():
+state_dict = dict(model.named_parameters())
+for name, param in state_dict.items():
+if "default" in name:
+ref_name = name.replace("default", "ref")
+if ref_name in state_dict:
+state_dict[ref_name].data.copy_(param.data)
+copied += 1
+print(f"[Ref] Synced adapter parameter tensors to reference adapter.")
+---------------------------------------------------------------------------# Padding-side context manager# ---------------------------------------------------------------------------
+
+@contextmanagerdef left_padding(tokenizer: AutoTokenizer):
+original = tokenizer.padding_side
+tokenizer.padding_side = "left"
+try:
+yield finally:
+tokenizer.padding_side = original
+---------------------------------------------------------------------------# VRAM cleanup helper# ---------------------------------------------------------------------------def release_vram(label: str = "") -> None:
+
+"""Synchronise CUDA, clear the cache and run garbage collection."""    import gc
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+gc.collect()
+torch.cuda.empty_cache()
+tag = f" [{}]" if label else ""
+print(f"[VRAM]{} Cache cleared.")
+
+---------------------------------------------------------------------------# Batched generation# ---------------------------------------------------------------------------def generate_answers_batch(
+
+    model,
+    tokenizer,
+    questions: list[str],
+    cfg: FrameworkConfig,
+    system_prompt: Optional[str] = None,
+
+) -> list[str]:
+
+prompt = "Always respond in a grammatically correct manner using correct noun-adjective gender/number agreement, even if the question contains typos or other grammatically incorrect words." \
+         "\nCRITICAL: Always respond in the SAME LANGUAGE as the user's question. " \
+         "\nProvide your answer to the question below. \nQuestion:\n"
+
+prompts = [
+    tokenizer.apply_chat_template(
+        [{"role": "system", "content": ""},
+         {"role": "user", "content": prompt + q}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    for q in questions
+]
+
+print(prompts)
+
+with left_padding(tokenizer):
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        add_special_tokens=False,
+        max_length=512,
+    ).to(model.device)
+
+input_len = inputs["input_ids"].shape[1]
+
+with torch.no_grad():
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=cfg.max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
         )
 
-        # 3. Update Model
-        loss = hybrid_train_step(model, tokenizer, optimizer, actions, prompts, device)
+# Free the input tensors before decoding    del inputs
+release_vram("post-generation inputs")
 
-        print(f"Batch {i // batch_size} | Loss: {loss:.4f}")
-        gc.collect()
-        torch.cuda.empty_cache()
+results = []
+for i in range(len(questions)):
+    new_ids = output_ids[i, input_len:]
+    text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+    print("---------------------Generated text:\n----------------------")
+    print(text[:500])
+    print("------------------------------------------------------------")
+    results.append(text)
 
-# ── I/O helpers ───────────────────────────────────────────────────────────────
+del output_ids
+release_vram("post-generation outputs")
+return results
 
-def load_jsonl(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        return [json.loads(line) for line in f]
+---------------------------------------------------------------------------# Batched judging# ---------------------------------------------------------------------------def judge_answers_batch(
 
+    model,
+    tokenizer,
+    questions: list[str],
+    generated_answers: list[str],
+    gold_answers: list[str],
+    filtered_idx: list[int],
+    cfg: FrameworkConfig,
+    judge_system_prompt: str,
+    max_judge_batch_size: int = 4,
 
-def is_short_enough(item, tokenizer, max_length=1024):
-    turns = item["conversations"]
-    total_tokens = sum(
-        len(tokenizer.encode(t.get("value", t.get("content", ""))))
-        for t in turns
-    )
-    return total_tokens <= max_length
+) -> list[tuple[dict, dict]]:
+num_examples = len(questions)
+results = [None] * num_examples # Pre-allocate to maintain order filtered_set = set(filtered_idx)
 
-
-def log_refined_data(original_id, status, diagnosis, fixed_text, old_text, correction_worked):
-    with open(SAVE_PATH, "a", encoding="utf-8") as f:
-        entry = {
-            "id": original_id,
-            "status": status,
-            "diagnosis": diagnosis,
-            "fixed_conversation": fixed_text,
-            "old_conversation": old_text,
-            "correction_worked": correction_worked
-        }
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-if __name__ == '__main__':
-    # ... (Keep your existing initialization code: Model loading, LoRA config, Dataset loading) ...
-    # This part remains exactly the same as your original script
-    model_id = "google/gemma-3-12b-it"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size = 1
-    SAVE_PATH = "data/refined_nemotron_dataset.jsonl"
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+# 1. Immediately handle auto-scored examples    for idx in filtered_idx:
+    results[idx] = (
+        {k: 1 for k in cfg.judge_criteria},
+        {k: 5 for k in cfg.judge_criteria}
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, quantization_config=bnb_config, device_map="auto", attn_implementation="flash_attention_2"
+# 2. Identify indices that actually need the LLM    indices_to_judge = [i for i in range(num_examples) if i not in filtered_set]
+
+if not indices_to_judge:
+    return results
+
+# 3. Process only the required indices in chunks    for start_ptr in range(0, len(indices_to_judge), max_judge_batch_size):
+    end_ptr = min(start_ptr + max_judge_batch_size, len(indices_to_judge))
+    current_batch_indices = indices_to_judge[start_ptr:end_ptr]
+
+    # Gather only the necessary data for this chunk        chunk_questions = [questions[i] for i in current_batch_indices]
+    chunk_gen = [generated_answers[i] for i in current_batch_indices]
+    chunk_gold = [gold_answers[i] for i in current_batch_indices]
+
+    # Handle Random Ordering        chunk_orderings = []
+    for gen, gold in zip(chunk_gen, chunk_gold):
+        if random.randint(0, 1) == 0:
+            chunk_orderings.append((gen, gold, "ANSWER 1", "ANSWER 2"))
+        else:
+            chunk_orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
+
+    # Build Prompts        chunk_prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "system", "content": judge_system_prompt},
+             {"role": "user", "content": f"QUESTION:\n{}\n\nANSWER 1:\n{}\n\nANSWER 2:\n{}"}],
+            tokenize=False, add_generation_prompt=True,
+        ) for q, (a1, a2, _, _) in zip(chunk_questions, chunk_orderings)
+    ]
+
+    # Inference        with left_padding(tokenizer):
+        inputs = tokenizer(
+            chunk_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+            max_length=cfg.max_seq_len,
+        ).to(model.device)
+
+    input_length = inputs["input_ids"].shape[1]
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=128,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    generated_tokens = output_ids[:, input_length:]
+    del inputs
+    release_vram("post-judge inputs chunk")
+
+    # 4. Parse and place back into the correct global position        for i, global_idx in enumerate(current_batch_indices):
+        _, _, generated_key, gs_key = chunk_orderings[i]
+        raw = tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
+
+        try:
+            print('----------------------------JUDGE------------------------------')
+            print(raw)
+            print('----------------------------JUDGE------------------------------')
+            cleaned = raw.replace("```json", "").replace("```", "").strip()
+            scores = json.loads(cleaned)
+            scores_generated = scores[generated_key]
+            scores_gs = scores[gs_key]
+
+            for k in cfg.judge_criteria:
+                scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
+                scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
+
+            results[global_idx] = (scores_generated, scores_gs)
+        except (json.JSONDecodeError, KeyError, ValueError):
+            print(f"[Judge ] Parse failed for idx {} — using fallback.")
+            results[global_idx] = (
+                {k: 1 for k in cfg.judge_criteria},
+                {k: 5 for k in cfg.judge_criteria}
+            )
+
+    del output_ids
+    release_vram(f"post-judge chunk complete")
+
+return results
+
+def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
+vals = [scores.get(k, 3) for k in cfg.judge_criteria]
+return (sum(vals) / len(vals) - 1) / 4.0
+---------------------------------------------------------------------------# Semantic guardrail (vectorised)# ---------------------------------------------------------------------------class SemanticGuardrail:
+
+def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    self.encoder = SentenceTransformer(model_name)
+
+def filter_batch(
+        self,
+        generated_texts: list[str],
+        gold_texts: list[str],
+        threshold: float,
+) -> list[bool]:
+    n = len(generated_texts)
+    texts = generated_texts + gold_texts
+    embs = self.encoder.encode(texts, convert_to_numpy=True)
+    gen_embs = embs[:n]
+    gold_embs = embs[n:]
+
+    keep = []
+    for i in range(n):
+        sim = float(cosine_similarity([gen_embs[i]], [gold_embs[i]])[0][0])
+        print(f"[Semantic] cosine = {sim:.4f}")
+        try:
+            same_lang = detect(generated_texts[i]) == detect(gold_texts[i])
+        except:
+            same_lang = False            print("Same language in gs and generated", same_lang)
+        keep.append(sim >= threshold and same_lang)
+    return keep
+
+---------------------------------------------------------------------------# Training example dataclass# ---------------------------------------------------------------------------
+
+@dataclassclass TrainingExample:
+question: str
+dpo_prompt: str
+chosen_completion: str
+rejected_completion: str
+reward_weight: float
+judge_prompt: str
+judge_response: str
+---------------------------------------------------------------------------# DPO prompt builder# ---------------------------------------------------------------------------def build_dpo_prompt(question: str, tokenizer: AutoTokenizer) -> str:
+
+messages = [
+    {
+        "role": "system",
+        "content": ""
+    },
+    {"role": "user", "content": question},
+]
+return tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True    )
+
+---------------------------------------------------------------------------# Inference phase: generate + guardrail + judge for a large inference batch# Returns a flat list of TrainingExample (or None for discarded items).# The model must already be set to "default" adapter and eval() before calling.# ---------------------------------------------------------------------------def run_inference_phase(
+
+    items: list[dict],
+    model,
+    tokenizer,
+    guardrail: SemanticGuardrail,
+    cfg: FrameworkConfig,
+    judge_system_prompt: str,
+
+) -> list[Optional[TrainingExample]]:
+""" Phase 1 – Generation (inference batch = cfg.inference_batch_size) Phase 2 – Semantic guardrail (CPU, no GPU memory impact) Phase 3 – Judging (inference batch = cfg.inference_batch_size)
+VRAM is released after generation output tensors are decoded and after judge output tensors are decoded. """ questions, golds = [], []
+for item in items:
+convs = item.get("conversations", [])
+questions.append(convs[0]["value"] if len(convs) >= 1 else "")
+golds.append(convs[1]["value"] if len(convs) >= 2 else "")
+
+# ── Phase 1: generation ──────────────────────────────────────────────    print(f"[Inference] Generating answers for {len(questions)} questions …")
+model.set_adapter("default")
+model.eval()
+
+generated_raw = generate_answers_batch(model, tokenizer, questions, cfg)
+
+keep_mask = guardrail.filter_batch(generated_raw, golds, cfg.min_cosine_similarity)
+
+filtered_idx = [i for i, keep in enumerate(keep_mask) if not keep]
+all_idx = [i for i, keep in enumerate(keep_mask)]
+for i, keep in enumerate(keep_mask):
+    if not keep:
+        print(f"[Guardrail] item {} DISCARDED — too far from gold or wrong language.")
+
+
+pass_questions  = [q for q in questions]
+pass_clean_gens = [c for c in generated_raw]
+pass_golds      = [g for g in golds]
+
+# ── Phase 3: judging ─────────────────────────────────────────────────    print(f"[Inference] Judging {len(pass_questions) - len(filtered_idx)} surviving answers …")
+# Still uses "default" adapter / eval mode from generation phase    judge_results = judge_answers_batch(
+    model, tokenizer,
+    pass_questions, pass_clean_gens, pass_golds, filtered_idx,
+    cfg, judge_system_prompt
+)
+
+# ── Assemble TrainingExamples ────────────────────────────────────────    output: list[Optional[TrainingExample]] = [None] * len(items)
+
+for rank, orig_idx in enumerate(all_idx):
+    scores_generated, scores_gs = judge_results[rank]
+    base_weight_gen = aggregate_score(scores_generated, cfg)
+    base_weight_gs  = aggregate_score(scores_gs,        cfg)
+
+    score_delta  = abs(base_weight_gen - base_weight_gs)
+    score_chosen  = max(base_weight_gen, base_weight_gs)
+    reward_weight = min(1.0, max(score_chosen, score_delta))
+
+    print(
+        f"[Reward] score_gen={base_weight_gen:.3f}  "
+        f"score_gs={base_weight_gs:.3f}  "
+        f"delta={score_delta:.3f} "
+        f"reward_weight={reward_weight:.3f}"
     )
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
-    lora_config = LoraConfig(
-        r=16, lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        task_type="CAUSAL_LM",
+    dpo_prompt = build_dpo_prompt(questions[orig_idx], tokenizer)
+
+    if base_weight_gen > base_weight_gs:
+        chosen_completion   = generated_raw[orig_idx]
+        rejected_completion = golds[orig_idx]
+    else:
+        chosen_completion   = golds[orig_idx]
+        rejected_completion = generated_raw[orig_idx]
+
+    sft_user = (
+        f"QUESTION:\n{questions[orig_idx]}\n\n"
+        f"ANSWER 1:\n{pass_clean_gens[rank]}\n\n"
+        f"ANSWER 2:\n{golds[orig_idx]}"
     )
-    model = get_peft_model(model, lora_config)
-    optimizer = Adam(get_lora_parameters(model), lr=1e-5)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    judge_prompt = tokenizer.apply_chat_template(
+        [{"role": "system", "content": judge_system_prompt},
+         {"role": "user", "content": sft_user}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    judge_response = json.dumps(
+        {"ANSWER 1": scores_generated, "ANSWER 2": scores_gs},
+        ensure_ascii=False,
+    )
 
-    # Mock data loading for context (Replace with your actual loaders)
-    manual_data = load_jsonl("data/gams_ft_dataset.json")
-    silver_data = load_jsonl("data/nemotron_sft_all_final_98k.json")
-    val_anchor = manual_data[:100]  # reduced for test
-    train_manual = manual_data[100:]
-    val_texts = [ex['conversations'][1]['value'] for ex in val_anchor]
-    val_embeddings = embedder.encode(val_texts, convert_to_tensor=True)
-    combined = silver_data + train_manual
-    combined = [item for item in combined if is_short_enough(item, tokenizer)]
-    random.shuffle(combined)
+    output[orig_idx] = TrainingExample(
+        question=questions[orig_idx],
+        dpo_prompt=dpo_prompt,
+        chosen_completion=chosen_completion,
+        rejected_completion=rejected_completion,
+        reward_weight=reward_weight,
+        judge_prompt=judge_prompt,
+        judge_response=judge_response,
+    )
 
-    train(combined, val_anchor, val_embeddings)
+return output
 
+def dpo_loss_weighted_batch(
+ref_lp_chosen: list[torch.Tensor],
+ref_lp_rejected: list[torch.Tensor],
+pol_lp_chosen: list[torch.Tensor],
+pol_lp_rejected: list[torch.Tensor],
+beta: float,
+reward_weights: list[float],
+) -> torch.Tensor:
+losses = []
+for rc, rr, pc, pr, w in zip(
+ref_lp_chosen, ref_lp_rejected,
+pol_lp_chosen, pol_lp_rejected,
+reward_weights,
+):
+chosen_ratio = pc - rc
+rejected_ratio = pr - rr
+margin = beta * (chosen_ratio - rejected_ratio) * w
+losses.append(-F.logsigmoid(margin))
+return torch.stack(losses).mean()
 
-To fix the problem, I want all losses and paths to be interconnected somehow
-1.) If the example is clean, I just do SFT
-2.) If the example is dirty, I ask the model to fix it. We then compare the quality of fix to the original one, using different criteria. I want a quality
-score that would say for example fixed example is 10% better than the original one, or fixed example is 20% worse than original one.
-4.) Afterwards, we do DPO, where I reinforce the model to be more similar to the better example (according to quality score) and less similar to the incorrect example
-If the fix does not succeed, the DPO loss is added an additional penalty according to the ratio of the quality score (e.g., loss + 0.2 * loss if fix is 20% worse than the original)
-If the fix succeed, the DPO loss is subtracted an additional penalty according to the ratio of the quality score (e.g., loss - 0.1 * if fix is 10% better than the original
+def compute_logprobs_and_sft(
+model,
+tokenizer,
+prompts: list[str],
+completions: list[str],
+max_len: int,
+compute_sft: bool = False,
+no_grad: bool = False,
+):
+# 1. Tokenize and pad encoded_full, prompt_lengths, seq_lengths = [], [], []
+for p, c in zip(prompts, completions):
+enc_f = tokenizer(
+p + c, return_tensors="pt", truncation=True, max_length=max_len,
+return_token_type_ids=True, add_special_tokens=False )
+enc_p = tokenizer(
+p, return_tensors="pt", truncation=True, max_length=max_len, add_special_tokens=False )
+encoded_full.append(enc_f)
+prompt_lengths.append(enc_p["input_ids"].shape[1])
+seq_lengths.append(enc_f["input_ids"].shape[1])
 
-Would that work? If yes, can you fix my code to do that?
+batch_size = len(prompts)
+max_full_len = max(seq_lengths)
+pad_id = tokenizer.pad_token_id
 
+padded_ids = torch.full((batch_size, max_full_len), pad_id, dtype=torch.long, device=model.device)
+padded_attn = torch.zeros((batch_size, max_full_len), dtype=torch.long, device=model.device)
+padded_ttids = torch.zeros((batch_size, max_full_len), dtype=torch.long)
+
+for i, enc in enumerate(encoded_full):
+    s_len = seq_lengths[i]
+    padded_ids[i, :s_len] = enc["input_ids"].squeeze(0)
+    padded_attn[i, :s_len] = enc["attention_mask"].squeeze(0)
+    padded_ttids[i, :s_len] = enc["token_type_ids"].squeeze(0)
+
+# 2. Forward pass    ctx = torch.inference_mode() if no_grad else torch.enable_grad()
+with ctx, torch.amp.autocast('cuda', dtype=torch.bfloat16):
+    outputs = model(input_ids=padded_ids, attention_mask=padded_attn, token_type_ids=padded_ttids,)
+
+shift_logits = outputs.logits[:, :-1, :].contiguous()
+shift_labels = padded_ids[:, 1:].contiguous()
+
+# 3. Memory efficient cross entropy (avoids logsumexp OOM)    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+ce_loss = loss_fct(
+    shift_logits.view(-1, shift_logits.size(-1)),
+    shift_labels.view(-1)
+)
+ce_loss = ce_loss.view(batch_size, -1)  # Shape: [batch, seq_len - 1]
+# logprob is just negative cross-entropy    token_lp = -ce_loss
+
+results_lp = []
+sft_loss_total = 0.0
+sft_tokens = 0
+
+# 4. Extract completion logprobs    for i, p_len in enumerate(prompt_lengths):
+    s_len = seq_lengths[i]
+    # Completion starts at p_len (in shifted labels it is p_len - 1)        completion_logprobs = token_lp[i, p_len - 1: s_len - 1]
+    results_lp.append(completion_logprobs.sum())
+
+    if compute_sft:
+        sft_loss_total -= completion_logprobs.sum()  # accumulate positive loss            sft_tokens += completion_logprobs.numel()
+
+sft_loss = (sft_loss_total / sft_tokens) if (compute_sft and sft_tokens > 0) else None
+# Force cleanup of massive graph roots    del outputs, shift_logits, shift_labels, padded_ids, padded_attn, ce_loss, token_lp
+
+if no_grad:
+    results_lp = [lp.detach() for lp in results_lp]
+
+return results_lp, sft_loss
+
+---------------------------------------------------------------------------# Training phase: consume a list of TrainingExamples in sub-batches# Returns (global_step, accum_count, running_loss) updated values.# ---------------------------------------------------------------------------def run_training_phase(
+
+    valid_examples: list[TrainingExample],
+    model,
+    tokenizer,
+    cfg: FrameworkConfig,
+    optimizer,
+    scheduler,
+    global_step: int,
+    accum_count: int,
+    running_loss: float,
+
+) -> tuple[int, int, float]:
+""" Splits valid_examples (the output of one inference batch) into sub-batches of size cfg.batch_size and runs SFT + DPO on each one, releasing VRAM between sub-batches. """ sub_batches = [
+valid_examples[i: i + cfg.batch_size]
+for i in range(0, len(valid_examples), cfg.batch_size)
+]
+
+# Enable gradient checkpointing for training, will be disabled after the loop    model.gradient_checkpointing_enable(
+    gradient_checkpointing_kwargs={"use_reentrant": False}
+)
+
+for sb_idx, sub_batch in enumerate(sub_batches):
+    n = len(sub_batch)
+    print(f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {} examples")
+
+    dpo_prompts          = [ex.dpo_prompt          for ex in sub_batch]
+    chosen_completions   = [ex.chosen_completion   for ex in sub_batch]
+    rejected_completions = [ex.rejected_completion for ex in sub_batch]
+    reward_weights       = [ex.reward_weight       for ex in sub_batch]
+    #judge_prompts        = [ex.judge_prompt        for ex in sub_batch]        #judge_responses      = [ex.judge_response      for ex in sub_batch]
+    # ── Ref log-probs (no grad, ref adapter) ──────────────────────        model.set_adapter("ref")
+    model.eval()
+
+    ref_lp_chosen, _ = compute_logprobs_and_sft(
+        model, tokenizer, dpo_prompts, chosen_completions, cfg.max_seq_len, compute_sft=False, no_grad=True        )
+    ref_lp_rejected, _ = compute_logprobs_and_sft(
+        model, tokenizer, dpo_prompts, rejected_completions, cfg.max_seq_len, compute_sft=False, no_grad=True        )
+
+    release_vram(f"sub-batch {sb_idx + 1} ref logprobs")
+
+    # ── Policy log-probs + SFT (with grad, default adapter) ───────        model.set_adapter("default")
+    model.train()
+
+    # 1. Forward chosen (Computes BOTH chosen logprobs AND SFT loss at the same time!)        pol_lp_chosen, loss_sft = compute_logprobs_and_sft(
+        model, tokenizer, dpo_prompts, chosen_completions, cfg.max_seq_len, compute_sft=True, no_grad=False        )
+
+    # 2. Forward rejected        pol_lp_rejected, _ = compute_logprobs_and_sft(
+        model, tokenizer, dpo_prompts, rejected_completions, cfg.max_seq_len, compute_sft=False, no_grad=False        )
+
+    # 3. Calculate DPO margin        loss_dpo = dpo_loss_weighted_batch(
+        ref_lp_chosen, ref_lp_rejected,
+        pol_lp_chosen, pol_lp_rejected,
+        beta=cfg.dpo_beta,
+        reward_weights=reward_weights,
+    )
+
+    #print('--------------Chosen completion-------------------------')        #print("prompts", dpo_prompts)        #print('\n\n\ Completions', chosen_completions)        # 4. Combine and Backpropagate        loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
+    (loss / cfg.grad_accumulation_steps).backward()
+
+    running_loss += loss.item()
+    accum_count  += n
+
+    # Free intermediate tensors now that gradients are accumulated        del ref_lp_chosen, ref_lp_rejected
+    del pol_lp_chosen, pol_lp_rejected
+    #del loss_dpo, loss_sft, loss        del loss_dpo, loss
+    release_vram(f"sub-batch {sb_idx + 1} post-backward")
+
+    # ── Optimizer step when accumulation threshold is reached ──────        if accum_count >= cfg.grad_accumulation_steps:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        global_step += 1
+        accum_count  = 0
+
+        avg          = running_loss / cfg.grad_accumulation_steps
+        running_loss = 0.0
+        print(
+            f"  Step {global_step:4d} | loss={avg:.4f}"
+        )
+
+        if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
+            sync_ref_model(model)
+
+        release_vram(f"step {} post-optimizer")
+
+# Disable gradient checkpointing so the next inference phase is clean    model.gradient_checkpointing_disable()
+release_vram("end of training phase")
+
+return global_step, accum_count, running_loss
+
+---------------------------------------------------------------------------# Online training loop# ---------------------------------------------------------------------------def train_online(
+
+    model,
+    tokenizer,
+    raw_data: list[dict],
+    guardrail: SemanticGuardrail,
+    cfg: FrameworkConfig,
+
+) -> None:
+os.makedirs(cfg.output_dir, exist_ok=True)
+# NOTE: gradient checkpointing is enabled only inside run_training_phase # and disabled again before returning, so inference always runs without it. model.gradient_checkpointing_disable()
+
+judge_system_prompt = build_judge_system_prompt(cfg.judge_criteria)
+
+optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.01)
+placeholder_total = max(1, cfg.cosine_cycle_steps * cfg.num_epochs)
+scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=cfg.warmup_steps,
+    num_training_steps=placeholder_total,
+    num_cycles=cfg.num_epochs,
+)
+
+global_step  = 0
+running_loss = 0.0
+accum_count  = 0
+
+for epoch in range(cfg.num_epochs):
+    print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{cfg.num_epochs}\n{'=' * 60}")
+
+    epoch_data = random.sample(raw_data, len(raw_data))
+    skipped    = 0
+    optimizer.zero_grad()
+
+    # Iterate over large INFERENCE batches        for inf_start in range(0, len(epoch_data), cfg.inference_batch_size):
+        inf_items = epoch_data[inf_start: inf_start + cfg.inference_batch_size]
+        print(
+            f"\n[Epoch {epoch + 1} | Inference items "
+            f"{inf_start + 1}–{inf_start + len(inf_items)}/{len(epoch_data)}]"
+        )
+
+        # ── INFERENCE PHASE (generation + guardrail + judging) ─────            examples = run_inference_phase(
+            inf_items, model, tokenizer, guardrail, cfg, judge_system_prompt
+        )
+
+        valid_examples = [ex for ex in examples if ex is not None]
+        skipped       += sum(1 for ex in examples if ex is None)
+
+        if not valid_examples:
+            print("[Batch] All items discarded by guardrail — skipping.")
+            continue
+        # VRAM is already clean after inference phase; now switch to training            release_vram("between inference and training phases")
+
+        # ── TRAINING PHASE (sub-batches of cfg.batch_size) ────────            print(
+            f"[Train] {len(valid_examples)} valid examples → "
+            f"{(len(valid_examples) + cfg.batch_size - 1) // cfg.batch_size} sub-batches "
+            f"of up to {cfg.batch_size}"
+        )
+        global_step, accum_count, running_loss = run_training_phase(
+            valid_examples, model, tokenizer, cfg,
+            optimizer, scheduler,
+            global_step, accum_count, running_loss,
+        )
+
+    # ── Flush any remaining gradient accumulation at end of epoch ─        if accum_count > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        global_step += 1
+        accum_count  = 0
+        print(f"  Step {global_step:4d} | flushed partial accumulation batch")
+        release_vram("end-of-epoch flush")
+
+    print(f"\n[Epoch {epoch + 1}] Skipped {}/{len(epoch_data)} items (guardrail).")
+
+    ckpt = f"{cfg.output_dir}/epoch_{epoch + 1}"
+    model.set_adapter("default")
+    model.save_pretrained(ckpt)
+    tokenizer.save_pretrained(ckpt)
+    print(f"[Checkpoint] Saved to {}")
+
+---------------------------------------------------------------------------# Data loading# ---------------------------------------------------------------------------def load_jsonl(path: str) -> list[dict]:
+
+with open(path, "r", encoding="utf-8") as f:
+    return [json.loads(line) for line in f]
+
+---------------------------------------------------------------------------# Main# ---------------------------------------------------------------------------def main(cfg: FrameworkConfig):
+
+print("[Init] Loading model with dual-adapters (Policy + Ref) and tokenizer...")
+model, tokenizer = load_model_and_tokenizer(cfg)
+
+print("[Init] Loading semantic guardrail...")
+guardrail = SemanticGuardrail(cfg.semantic_model_name)
+
+print(f"[Data] Reading {cfg.data_path}...")
+raw_data = load_jsonl(cfg.data_path)
+print(f"[Data] {len(raw_data)} raw examples loaded.")
+
+train_online(model, tokenizer, raw_data, guardrail, cfg)
+print("\n[Done] Training complete.")
+
+if name == "main":
+cfg = FrameworkConfig(
+model_name="google/gemma-3-12b-it",
+data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
+num_epochs=1,
+load_in_4bit=False,
+inference_batch_size=32, #generate batch max_judge_batch_size=8,#judge batch at a time batch_size=2, # train 4 at a time output_dir="./checkpoints_meta_learning",
+ref_update_interval=100,
+)
+main(cfg)
+
+As said above, the code has an inference phase and then also a training phase made of sft and dpo. I want to scale it a bit:
+- first I want to do full weight training instead of lora
+- I want to use deepspeed stage 2 (or if not possible, accelerate) for scalable training and inference across several gpus. If possible, I don't want to split one model across several gpus since this will decrease the speed. Crucially, I need to conduct inference and judging also on all available gpus, since this is the slowest part.
+-I want to also support multimodal inputs, i.e., prompts containing images. Not all prompts will contain images. For this, AutoModelForCausalLM, should be replaced with AutoProcessor or GemmaProcessor. The weights of the vision tower can remain frozen during training though. This is an example multimodal (image-text input:
+
+{"id": "66627-results/rtv_zabava-in-slog", "image": "path_to_image", "conversations": [{"from": "human", "value": "<image>\nŽivjo! Imam vprašanje glede krvavitev med spolnim odnosom. Gledala sem neko sliko, kjer je ženska videti zaskrbljena, pa me je spomnilo na mojo težavo. Kaj lahko poveš o tem?"}, {"from": "gpt", "value": "Živjo! Razumem. Krvavitev med spolnim odnosom, strokovno imenovana postkoitalna krvavitev, je lahko zaskrbljujoča, vendar pogosto ni znak resne težave. Je pa pomembno, da se o tem pogovorite z zdravnikom, da se izključijo morebitni vzroki. Vidim sliko ženske s sklonjeno glavo in zaskrbljenim izrazom, kar povsem ustreza občutkom, ki jih lahko povzroči takšna izkušnja. Ali te zanima, kaj bi lahko bil vzrok za krvavitev?"}, {"from": "human", "value": "Ja, seveda me zanima. In še to... sem stara 35 let in še nisem rodila, s partnerjem pa si močno želiva otroka. Ali lahko to vpliva na samo krvavitev?"}, {"from": "gpt", "value": "Starost in dejstvo, da še niste rodili, sta pomembna dejavnika pri ocenjevanju možnih vzrokov krvavitve. Pri 35 letih in želji po zanositvi je pomembno izključiti morebitne težave, ki bi lahko vplivale na plodnost. Možni vzroki krvavitve med spolnim odnosom so lahko različni: vnetje ali infekcija materničnega vratu, polipi na materničnem vratu ali v nožnici, suhost nožnice (še posebej, če ne uporabljate zadostne lubrikacije med spolnim odnosom), ektopija materničnega vratu (pogosta pri mlajših ženskah in tistih, ki jemljejo kontracepcijske tablete), in v redkih primerih tudi rak materničnega vratu. Hormonske spremembe, ki lahko nastanejo zaradi različnih vzrokov, vključno z željo po zanositvi, lahko vplivajo na občutljivost tkiva. Stres lahko tudi vpliva na telo in prispeva k suhosti nožnice. Je pomembno, da se o vsem tem pogovorite s svojim ginekologom. Mu lahko zaupate tudi te informacije, saj so zelo pomembne za postavitev diagnoze. Če gledava na sliko, lahko vidiva, da ženska stiska roke, kar lahko nakazuje na tesnobo in stres, ki ju lahko povzroča ta problem. Kaj so ti rekli tvoj ginekolog?"}]}
+
+Please return the updated python code. Do not change anything that does not need to be changed, return entire code, without skipping out any functions or prints!

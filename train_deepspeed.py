@@ -5,140 +5,347 @@ import torch
 import torch.nn.functional as F
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
+from PIL import Image
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed
-from torch.utils.data import Dataset, DataLoader
-
 from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
+    AutoProcessor,
+    AutoModelForImageTextToText,
     get_cosine_with_hard_restarts_schedule_with_warmup,
 )
-from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from torch.optim import AdamW
 from langdetect import detect
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 @dataclass
 class FrameworkConfig:
+    # Model
     model_name: str = "google/gemma-3-12b-it"
-    # TIP: For maximum speed on DeepSpeed ZeRO-3, set load_in_4bit=False and use bf16.
-    # For ZeRO-2, load_in_4bit=True (QLoRA) works great.
-    load_in_4bit: bool = True
 
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_target_modules: list = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj",
-                                 "gate_proj", "up_proj", "down_proj"]
-    )
-
+    # Data
     data_path: str = "data/gams_ft_dataset.json"
-    max_seq_len: int = 2048
+    max_seq_len: int = (2 * 1024) + 256
+
+    # Semantic guardrail
     semantic_model_name: str = "all-MiniLM-L6-v2"
     min_cosine_similarity: float = 0.35
 
+    # Judge criteria — drives the dynamic system prompt
     judge_criteria: list = field(default_factory=lambda: [
-        "grammar", "semantics", "flow", "completeness", "clarity",
+        "grammar",
+        "semantics",
+        "flow",
+        "completeness",
+        "clarity",
     ])
 
+    # Training
     dpo_beta: float = 0.1
-    thinking_bonus: float = 0.3
-    min_think_tokens: int = 20
     learning_rate: float = 5e-5
     num_epochs: int = 1
-
-    # Batch sizes are now PER GPU
-    inference_batch_size: int = 16
-    batch_size: int = 4
-    grad_accumulation_steps: int = 8
-
+    inference_batch_size: int = 32  # large batch for generation
+    max_judge_batch_size: int = 8  # max batch size for judging
+    batch_size: int = 4  # smaller sub-batch for SFT + DPO training
+    grad_accumulation_steps: int = 1
     warmup_steps: int = 50
     cosine_cycle_steps: int = 200
-    sft_loss_weight: float = 0.3
+    sft_loss_weight: float = 0.4
     output_dir: str = "./checkpoints"
+
     ref_update_interval: int = 100
 
+    # Generation
     max_new_tokens: int = 1024
     temperature: float = 0.7
     top_p: float = 0.9
 
 
-THINK_START = "<think>"
-THINK_END = "</think>"
-
-
 # ---------------------------------------------------------------------------
-# Prompts & Utilities
+# Dynamic judge system prompt
 # ---------------------------------------------------------------------------
 def build_judge_system_prompt(criteria: list[str]) -> str:
-    def _desc(name):
-        return {
-            "grammar": "grammatical and linguistic correctness",
-            "semantics": "semantic accuracy and factual correctness",
-            "flow": "readability, coherence, and logical flow",
-            "completeness": "how thoroughly the answer covers the topic",
-            "clarity": "simplicity and clarity of explanation",
-        }.get(name, name)
-
-    criteria_lines = "\n".join(f"{i + 1}. {c:<14} – {_desc(c)}" for i, c in enumerate(criteria))
+    criteria_lines = "\n".join(
+        f"{i + 1}. {c:<14} – {_criterion_description(c)}"
+        for i, c in enumerate(criteria)
+    )
+    criteria_keys = ", ".join(f'"{c}": <1-5>' for c in criteria)
     return f"""\
-You are a strict but fair language judge. You will be given a QUESTION, ANSWER 1, and ANSWER 2.
-Score BOTH ANSWERS on these {len(criteria)} criteria (score 1–5, where 5 is best):
-{}
+You are a strict but fair language judge. You will be given:
+    A QUESTION
+    ANSWER 1
+    ANSWER 2
+
+Your task is to score BOTH ANSWERS on these {len(criteria)} criteria (score 1–5, where 5 is best):
+{criteria_lines}
 
 Return ONLY a valid JSON object with exactly this structure:
 {{
-  "ANSWER 1": {{"grammar": <1-5>, ...}},
-  "ANSWER 2": {{"grammar": <1-5>, ...}}
+    "ANSWER 1": {{{criteria_keys}}},
+    "ANSWER 2": {{{criteria_keys}}}
 }}
+
 Do NOT add any explanation, markdown, or extra text."""
 
 
-def build_dpo_prompt(question: str, tokenizer: AutoTokenizer) -> str:
-    prompt = "You are a helpful assistant. " \
-             "CRITICAL: Always respond in the SAME LANGUAGE as the user's question. " \
-             f"You MUST reason step by step inside {} and {} tags first. " \
-             f"You MUST include the closing {} tag when you are done reasoning! " \
-             "Then provide your final answer. \nQuestion:\n"
-    return tokenizer.apply_chat_template(
-        [{"role": "system", "content": ""}, {"role": "user", "content": prompt + question}],
-        tokenize=False, add_generation_prompt=True
+def _criterion_description(name: str) -> str:
+    return {
+        "grammar": "grammatical and linguistic correctness",
+        "semantics": "semantic accuracy and factual correctness",
+        "flow": "readability, coherence, and logical flow",
+        "completeness": "how thoroughly the answer covers the topic",
+        "clarity": "simplicity and clarity of explanation",
+    }.get(name, name)
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
+    accelerator.print("[Init] Loading processor...")
+    processor = AutoProcessor.from_pretrained(cfg.model_name)
+    processor.tokenizer.padding_side = "right"
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+    accelerator.print("[Init] Loading policy model...")
+    model = AutoModelForImageTextToText.from_pretrained(
+        cfg.model_name,
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2"
     )
 
+    # Freeze vision tower for policy model
+    for name, param in model.named_parameters():
+        if "vision" in name.lower() or "vit" in name.lower():
+            param.requires_grad_(False)
 
+
+    accelerator.print("[Init] Loading frozen reference model...")
+    ref_model = AutoModelForImageTextToText.from_pretrained(
+        cfg.model_name,
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2"
+    )
+    for param in ref_model.parameters():
+        param.requires_grad_(False)
+    ref_model.eval()
+
+    return model, ref_model, processor
+
+
+# ---------------------------------------------------------------------------
+# Padding-side context manager
+# ---------------------------------------------------------------------------
 @contextmanager
-def left_padding(tokenizer: AutoTokenizer):
-    original = tokenizer.padding_side
-    tokenizer.padding_side = "left"
+def left_padding(processor: AutoProcessor):
+    original = processor.tokenizer.padding_side
+    processor.tokenizer.padding_side = "left"
     try:
         yield
     finally:
-        tokenizer.padding_side = original
+        processor.tokenizer.padding_side = original
 
 
-def strip_thinking(text: str) -> str:
-    if THINK_END in text: return text.split(THINK_END)[-1].strip()
-    return text.replace(THINK_START, "").strip()
+# ---------------------------------------------------------------------------
+# VRAM cleanup helper
+# ---------------------------------------------------------------------------
+def release_vram(accelerator: Accelerator, label: str = "") -> None:
+    """Synchronise CUDA, clear the cache and run garbage collection."""
+    import gc
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    # accelerator.print(f"[VRAM] [{label}] Cache cleared.") # Un-comment to trace memory
 
 
-def has_thinking(text: str, tokenizer, min_tokens: int) -> bool:
-    if THINK_END in text:
-        think_content = text.split(THINK_START)[-1].split(THINK_END)[0].strip()
-    elif THINK_START in text:
-        think_content = text.split(THINK_START)[-1].strip()
-    else:
-        return False
-    return bool(think_content) and len(tokenizer.encode(think_content, add_special_tokens=False)) >= min_tokens
+# ---------------------------------------------------------------------------
+# Batched generation
+# ---------------------------------------------------------------------------
+def generate_answers_batch(
+        model,
+        processor,
+        questions: list[dict],
+        cfg: FrameworkConfig,
+        accelerator: Accelerator,
+) -> list[str]:
+    prompt_sys = "Always respond in a grammatically correct manner using correct noun-adjective gender/number agreement, even if the question contains typos or other grammatically incorrect words.\nCRITICAL: Always respond in the SAME LANGUAGE as the user's question.\nProvide your answer to the question below. \nQuestion:\n"
+
+    prompts_text = []
+    batch_images = []
+
+    for q in questions:
+        content_list = []
+        if q["image"] is not None:
+            content_list.append({"type": "image"})
+            batch_images.append(q["image"])
+
+        # Clean explicit image tags if they exist to pass cleanly to Chat Template framework
+        clean_text = q["text"].replace("<image>\n", "").replace("<image>", "")
+        content_list.append({"type": "text", "text": prompt_sys + clean_text})
+
+        msgs = [{"role": "system", "content": ""}, {"role": "user", "content": content_list}]
+        prompts_text.append(processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+
+    with left_padding(processor):
+        inputs = processor(
+            text=prompts_text,
+            images=batch_images if batch_images else None,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+            max_length=1536,  # Avoid heavy truncation on prompt to preserve images
+        ).to(accelerator.device)
+
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad(), torch.inference_mode():
+        output_ids = accelerator.unwrap_model(model).generate(
+            **inputs,
+            max_new_tokens=cfg.max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=processor.tokenizer.pad_token_id,
+        )
+
+    del inputs
+    release_vram(accelerator, "post-generation inputs")
+
+    results = []
+    for i in range(len(questions)):
+        new_ids = output_ids[i, input_len:]
+        text = processor.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+        results.append(text)
+
+    del output_ids
+    release_vram(accelerator, "post-generation outputs")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Batched judging
+# ---------------------------------------------------------------------------
+def judge_answers_batch(
+        model,
+        processor,
+        questions: list[dict],
+        generated_answers: list[str],
+        gold_answers: list[str],
+        filtered_idx: list[int],
+        cfg: FrameworkConfig,
+        judge_system_prompt: str,
+        accelerator: Accelerator,
+) -> list[tuple[dict, dict]]:
+    num_examples = len(questions)
+    results = [None] * num_examples
+    filtered_set = set(filtered_idx)
+
+    # 1. Immediately handle auto-scored examples
+    for idx in filtered_idx:
+        results[idx] = (
+            {k: 1 for k in cfg.judge_criteria},
+            {k: 5 for k in cfg.judge_criteria}
+        )
+
+    # 2. Identify indices that actually need the LLM
+    indices_to_judge = [i for i in range(num_examples) if i not in filtered_set]
+
+    if not indices_to_judge:
+        return results
+
+    # 3. Process only the required indices in chunks
+    for start_ptr in range(0, len(indices_to_judge), cfg.max_judge_batch_size):
+        end_ptr = min(start_ptr + cfg.max_judge_batch_size, len(indices_to_judge))
+        current_batch_indices = indices_to_judge[start_ptr:end_ptr]
+
+        chunk_questions = [questions[i] for i in current_batch_indices]
+        chunk_gen = [generated_answers[i] for i in current_batch_indices]
+        chunk_gold = [gold_answers[i] for i in current_batch_indices]
+
+        chunk_orderings = []
+        for gen, gold in zip(chunk_gen, chunk_gold):
+            if random.randint(0, 1) == 0:
+                chunk_orderings.append((gen, gold, "ANSWER 1", "ANSWER 2"))
+            else:
+                chunk_orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
+
+        chunk_prompts = []
+        batch_images = []
+        for q_dict, (a1, a2, _, _) in zip(chunk_questions, chunk_orderings):
+            content_list = []
+            if q_dict["image"] is not None:
+                content_list.append({"type": "image"})
+                batch_images.append(q_dict["image"])
+
+            clean_text = q_dict["text"].replace("<image>\n", "").replace("<image>", "")
+            user_content = f"QUESTION:\n{clean_text}\n\nANSWER 1:\n{a1}\n\nANSWER 2:\n{a2}"
+            content_list.append({"type": "text", "text": user_content})
+
+            msgs = [{"role": "system", "content": judge_system_prompt}, {"role": "user", "content": content_list}]
+            chunk_prompts.append(processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+
+        with left_padding(processor):
+            inputs = processor(
+                text=chunk_prompts,
+                images=batch_images if batch_images else None,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                add_special_tokens=False,
+                max_length=cfg.max_seq_len,
+            ).to(accelerator.device)
+
+        input_length = inputs["input_ids"].shape[1]
+
+        with torch.inference_mode():
+            output_ids = accelerator.unwrap_model(model).generate(
+                **inputs,
+                max_new_tokens=128,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=processor.tokenizer.pad_token_id,
+            )
+
+        generated_tokens = output_ids[:, input_length:]
+        del inputs
+        release_vram(accelerator, "post-judge inputs chunk")
+
+        for i, global_idx in enumerate(current_batch_indices):
+            _, _, generated_key, gs_key = chunk_orderings[i]
+            raw = processor.tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
+
+            try:
+                cleaned = raw.replace("```json", "").replace("```", "").strip()
+                scores = json.loads(cleaned)
+                scores_generated = scores[generated_key]
+                scores_gs = scores[gs_key]
+
+                for k in cfg.judge_criteria:
+                    scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
+                    scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
+
+                results[global_idx] = (scores_generated, scores_gs)
+            except (json.JSONDecodeError, KeyError, ValueError):
+                accelerator.print(f"[Judge ] Parse failed for idx {global_idx} — using fallback.")
+                results[global_idx] = (
+                    {k: 1 for k in cfg.judge_criteria},
+                    {k: 5 for k in cfg.judge_criteria}
+                )
+
+        del output_ids
+        release_vram(accelerator, "post-judge chunk complete")
+
+    return results
 
 
 def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
@@ -147,380 +354,519 @@ def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Dataset & Loading
+# Semantic guardrail (vectorised, text only)
 # ---------------------------------------------------------------------------
-class RLHFDataset(Dataset):
-    def __init__(self, data_path: str):
-        with open(data_path, "r", encoding="utf-8") as f:
-            self.data = [json.loads(line) for line in f]
+class SemanticGuardrail:
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: str = "cpu"):
+        self.encoder = SentenceTransformer(model_name, device=device)
 
-    def __len__(self):
-        return len(self.data)
+    def filter_batch(
+            self,
+            generated_texts: list[str],
+            gold_texts: list[str],
+            threshold: float,
+    ) -> list[bool]:
+        n = len(generated_texts)
+        texts = generated_texts + gold_texts
+        embs = self.encoder.encode(texts, convert_to_numpy=True)
+        gen_embs = embs[:n]
+        gold_embs = embs[n:]
 
-    def __getitem__(self, idx):
-        convs = self.data[idx].get("conversations", [])
-        q = convs[0]["value"] if len(convs) >= 1 else ""
-        g = convs[1]["value"] if len(convs) >= 2 else ""
-        return {"question": q, "gold": g}
+        keep = []
+        for i in range(n):
+            sim = float(cosine_similarity([gen_embs[i]], [gold_embs[i]])[0][0])
+            try:
+                same_lang = detect(generated_texts[i]) == detect(gold_texts[i])
+            except:
+                same_lang = False
+            keep.append(sim >= threshold and same_lang)
+        return keep
 
 
-def load_model_and_tokenizer(cfg: FrameworkConfig):
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-    tokenizer.padding_side = "right"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+# ---------------------------------------------------------------------------
+# Training example dataclass
+# ---------------------------------------------------------------------------
+@dataclass
+class TrainingExample:
+    question_text: str
+    question_image: Optional[Any]
+    dpo_prompt: str
+    chosen_completion: str
+    rejected_completion: str
+    reward_weight: float
+    judge_prompt: str
+    judge_response: str
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True
-    ) if cfg.load_in_4bit else None
 
-    # NO device_map="auto" -> DeepSpeed/Accelerate handles distribution automatically
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name,
-        quantization_config=bnb_config,
-        torch_dtype=torch.bfloat16 if not cfg.load_in_4bit else None,
-        attn_implementation="flash_attention_2"
+# ---------------------------------------------------------------------------
+# DPO prompt builder
+# ---------------------------------------------------------------------------
+def build_dpo_prompt(q_dict: dict, processor: AutoProcessor) -> str:
+    content_list = []
+    if q_dict["image"] is not None:
+        content_list.append({"type": "image"})
+
+    clean_text = q_dict["text"].replace("<image>\n", "").replace("<image>", "")
+    content_list.append({"type": "text", "text": clean_text})
+
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": content_list},
+    ]
+    return processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
 
-    if cfg.load_in_4bit:
-        model = prepare_model_for_kbit_training(model)
 
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM, r=cfg.lora_r, lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout, target_modules=cfg.lora_target_modules, bias="none"
+# ---------------------------------------------------------------------------
+# Inference phase
+# ---------------------------------------------------------------------------
+def run_inference_phase(
+        items: list[dict],
+        model,
+        processor,
+        guardrail: SemanticGuardrail,
+        cfg: FrameworkConfig,
+        judge_system_prompt: str,
+        accelerator: Accelerator,
+) -> list[Optional[TrainingExample]]:
+    questions, golds = [], []
+    for item in items:
+        convs = item.get("conversations", [])
+        q_text = convs[0]["value"] if len(convs) >= 1 else ""
+        g_text = convs[1]["value"] if len(convs) >= 2 else ""
+
+        img_path = item.get("image")
+        img_obj = None
+        if img_path and os.path.exists(img_path):
+            try:
+                img_obj = Image.open(img_path).convert("RGB")
+            except Exception as e:
+                accelerator.print(f"[Warning] Failed to load image {img_path}: {e}")
+
+        questions.append({"text": q_text, "image": img_obj})
+        golds.append(g_text)
+
+    # ── Phase 1: generation ──────────────────────────────────────────────
+    accelerator.print(f"[Inference] Generating answers for {len(questions)} questions …")
+    model.eval()
+
+    generated_raw = generate_answers_batch(model, processor, questions, cfg, accelerator)
+
+    # ── Phase 2: semantic guardrail ──────────────────────────────────────
+    keep_mask = guardrail.filter_batch(generated_raw, golds, cfg.min_cosine_similarity)
+
+    filtered_idx = [i for i, keep in enumerate(keep_mask) if not keep]
+    all_idx = [i for i, keep in enumerate(keep_mask)]
+    for i, keep in enumerate(keep_mask):
+        if not keep:
+            accelerator.print(f"[Guardrail] item {i} DISCARDED — too far from gold or wrong language.")
+
+    pass_questions = [q for q in questions]
+    pass_clean_gens = [c for c in generated_raw]
+    pass_golds = [g for g in golds]
+
+    # ── Phase 3: judging ─────────────────────────────────────────────────
+    accelerator.print(f"[Inference] Judging {len(pass_questions) - len(filtered_idx)} surviving answers …")
+
+    judge_results = judge_answers_batch(
+        model, processor,
+        pass_questions, pass_clean_gens, pass_golds, filtered_idx,
+        cfg, judge_system_prompt, accelerator
     )
-    model = get_peft_model(model, lora_config, adapter_name="default")
-    model.add_adapter("ref", lora_config)
 
-    for name, param in model.named_parameters():
-        if "ref" in name: param.requires_grad_(False)
+    # ── Assemble TrainingExamples ────────────────────────────────────────
+    output: list[Optional[TrainingExample]] = [None] * len(items)
 
-    return model, tokenizer
+    for rank, orig_idx in enumerate(all_idx):
+        if orig_idx in filtered_idx:
+            continue
 
+        scores_generated, scores_gs = judge_results[rank]
+        base_weight_gen = aggregate_score(scores_generated, cfg)
+        base_weight_gs = aggregate_score(scores_gs, cfg)
 
-def sync_ref_model(model, accelerator) -> None:
-    unwrapped = accelerator.unwrap_model(model)
-    with torch.no_grad():
-        state_dict = dict(unwrapped.named_parameters())
-        for name, param in state_dict.items():
-            if "default" in name:
-                ref_name = name.replace("default", "ref")
-                if ref_name in state_dict:
-                    state_dict[ref_name].data.copy_(param.data)
-    if accelerator.is_main_process:
-        print(f"[Ref] Synced adapter parameter tensors to reference adapter.")
+        score_delta = abs(base_weight_gen - base_weight_gs)
+        score_chosen = max(base_weight_gen, base_weight_gs)
+        reward_weight = min(1.0, max(score_chosen, score_delta))
 
+        dpo_prompt = build_dpo_prompt(questions[orig_idx], processor)
 
-# ---------------------------------------------------------------------------
-# Inference (Generation & Judging)
-# ---------------------------------------------------------------------------
-def generate_answers_batch(model, tokenizer, questions, cfg, accelerator):
-    prompts = [build_dpo_prompt(q, tokenizer) for q in questions]
-    with left_padding(tokenizer):
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False,
-                           max_length=cfg.max_seq_len).to(accelerator.device)
+        if base_weight_gen > base_weight_gs:
+            chosen_completion = generated_raw[orig_idx]
+            rejected_completion = golds[orig_idx]
+        else:
+            chosen_completion = golds[orig_idx]
+            rejected_completion = generated_raw[orig_idx]
 
-    unwrapped_model = accelerator.unwrap_model(model)
-    with torch.inference_mode():
-        output_ids = unwrapped_model.generate(
-            **inputs, max_new_tokens=cfg.max_new_tokens, do_sample=False, use_cache=True,
-            pad_token_id=tokenizer.pad_token_id
+        clean_text = questions[orig_idx]["text"].replace("<image>\n", "").replace("<image>", "")
+        sft_user = (
+            f"QUESTION:\n{clean_text}\n\n"
+            f"ANSWER 1:\n{pass_clean_gens[rank]}\n\n"
+            f"ANSWER 2:\n{golds[orig_idx]}"
+        )
+        content_list = []
+        if questions[orig_idx]["image"] is not None:
+            content_list.append({"type": "image"})
+        content_list.append({"type": "text", "text": sft_user})
+
+        judge_prompt = processor.apply_chat_template(
+            [{"role": "system", "content": judge_system_prompt},
+             {"role": "user", "content": content_list}],
+            tokenize=False, add_generation_prompt=True,
         )
 
-    results = []
-    for i in range(len(questions)):
-        new_ids = output_ids[i, inputs["input_ids"].shape[1]:]
-        results.append(tokenizer.decode(new_ids, skip_special_tokens=True).strip())
-    return results
+        judge_response = json.dumps(
+            {"ANSWER 1": scores_generated, "ANSWER 2": scores_gs},
+            ensure_ascii=False,
+        )
+
+        output[orig_idx] = TrainingExample(
+            question_text=questions[orig_idx]["text"],
+            question_image=questions[orig_idx]["image"],
+            dpo_prompt=dpo_prompt,
+            chosen_completion=chosen_completion,
+            rejected_completion=rejected_completion,
+            reward_weight=reward_weight,
+            judge_prompt=judge_prompt,
+            judge_response=judge_response,
+        )
+
+    return output
 
 
-def judge_answers_batch(model, tokenizer, questions, generated_answers, gold_answers, cfg, judge_system_prompt,
-                        accelerator):
-    orderings = []
-    for gen, gold in zip(generated_answers, gold_answers):
-        if random.randint(0, 1) == 0:
-            orderings.append((gen, gold, "ANSWER 1", "ANSWER 2"))
-        else:
-            orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
-
-    prompts = []
-    for q, (a1, a2, _, _) in zip(questions, orderings):
-        user_content = f"QUESTION:\n{}\n\nANSWER 1:\n{}\n\nANSWER 2:\n{}\n"
-        prompts.append(tokenizer.apply_chat_template(
-            [{"role": "system", "content": judge_system_prompt}, {"role": "user", "content": user_content}],
-            tokenize=False, add_generation_prompt=True
-        ))
-
-    with left_padding(tokenizer):
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False,
-                           max_length=cfg.max_seq_len).to(accelerator.device)
-
-    unwrapped_model = accelerator.unwrap_model(model)
-    with torch.inference_mode():
-        output_ids = unwrapped_model.generate(**inputs, max_new_tokens=256, do_sample=False, use_cache=True,
-                                              pad_token_id=tokenizer.pad_token_id)
-
-    results = []
-    for i, (_, _, generated_key, gs_key) in enumerate(orderings):
-        raw = tokenizer.decode(output_ids[i, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
-        try:
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
-            scores = json.loads(cleaned)
-            scores_generated = scores[generated_key]
-            scores_gs = scores[gs_key]
-            for k in cfg.judge_criteria:
-                scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
-                scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
-            results.append((scores_generated, scores_gs))
-        except:
-            results.append(({k: 1 for k in cfg.judge_criteria}, {k: 5 for k in cfg.judge_criteria}))
-    return results
+def dpo_loss_weighted_batch(
+        ref_lp_chosen: list[torch.Tensor],
+        ref_lp_rejected: list[torch.Tensor],
+        pol_lp_chosen: list[torch.Tensor],
+        pol_lp_rejected: list[torch.Tensor],
+        beta: float,
+        reward_weights: list[float],
+) -> torch.Tensor:
+    losses = []
+    for rc, rr, pc, pr, w in zip(
+            ref_lp_chosen, ref_lp_rejected,
+            pol_lp_chosen, pol_lp_rejected,
+            reward_weights,
+    ):
+        chosen_ratio = pc - rc
+        rejected_ratio = pr - rr
+        margin = beta * (chosen_ratio - rejected_ratio) * w
+        losses.append(-F.logsigmoid(margin))
+    return torch.stack(losses).mean()
 
 
-# ---------------------------------------------------------------------------
-# Loss Functions
-# ---------------------------------------------------------------------------
-def batched_log_probs(model, tokenizer, prompts, completions, max_len, accelerator, no_grad=False):
-    encoded_full, encoded_prompt = [], []
-    for p, c in zip(prompts, completions):
-        encoded_full.append(
-            tokenizer(p + c, return_tensors="pt", truncation=True, max_length=max_len, add_special_tokens=False))
-        encoded_prompt.append(
-            tokenizer(p, return_tensors="pt", truncation=True, max_length=max_len, add_special_tokens=False))
+def compute_logprobs_and_sft(
+        model,
+        processor,
+        prompts: list[str],
+        completions: list[str],
+        images_list: list[Optional[Any]],
+        max_len: int,
+        compute_sft: bool = False,
+        no_grad: bool = False,
+):
+    batch_imgs = [img for img in images_list if img is not None]
 
-    batch_size = len(prompts)
-    max_full_len = max(e["input_ids"].shape[1] for e in encoded_full)
+    # Right padding naturally isolates targets at the end
+    original_pad_side = processor.tokenizer.padding_side
+    processor.tokenizer.padding_side = "right"
 
-    padded_ids = torch.full((batch_size, max_full_len), tokenizer.pad_token_id, dtype=torch.long,
-                            device=accelerator.device)
-    padded_attn = torch.zeros((batch_size, max_full_len), dtype=torch.long, device=accelerator.device)
+    enc_f_batch = processor(
+        text=[p + c for p, c in zip(prompts, completions)],
+        images=batch_imgs if batch_imgs else None,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        add_special_tokens=False
+    ).to(model.device)
 
-    for i, enc in enumerate(encoded_full):
-        seq_len = enc["input_ids"].shape[1]
-        padded_ids[i, :seq_len] = enc["input_ids"].squeeze(0)
-        padded_attn[i, :seq_len] = enc["attention_mask"].squeeze(0)
+    # Find where completion starts inside the right-padded sequences
+    prompt_lengths = []
+    seq_lengths = []
+    for i, (p, img) in enumerate(zip(prompts, images_list)):
+        enc_p = processor(
+            text=p,
+            images=[img] if img is not None else None,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_len,
+            add_special_tokens=False
+        )
+        prompt_lengths.append(enc_p["input_ids"].shape[1])
+        seq_lengths.append(enc_f_batch["attention_mask"][i].sum().item())
+
+    processor.tokenizer.padding_side = original_pad_side
 
     ctx = torch.inference_mode() if no_grad else torch.enable_grad()
-    with ctx:
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            logits = model(input_ids=padded_ids, attention_mask=padded_attn).logits
+    with ctx, torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        outputs = model(**enc_f_batch)
 
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = padded_ids[:, 1:].contiguous().unsqueeze(-1)
+    shift_logits = outputs.logits[:, :-1, :].contiguous()
+    shift_labels = enc_f_batch["input_ids"][:, 1:].contiguous()
 
-    token_logits = shift_logits.gather(2, shift_labels).squeeze(-1)
-    log_z = torch.logsumexp(shift_logits, dim=-1)
-    token_lp = token_logits - log_z
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+    ce_loss = loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1)
+    )
+    ce_loss = ce_loss.view(len(prompts), -1)
+    token_lp = -ce_loss
 
-    results = []
-    for i, enc_p in enumerate(encoded_prompt):
-        prompt_len = enc_p["input_ids"].shape[1]
-        seq_len = encoded_full[i]["input_ids"].shape[1]
+    results_lp = []
+    sft_loss_total = 0.0
+    sft_tokens = 0
 
-        mask = torch.zeros(seq_len - 1, dtype=torch.bool, device=accelerator.device)
-        mask[prompt_len - 1:seq_len - 1] = True
+    for i, p_len in enumerate(prompt_lengths):
+        s_len = seq_lengths[i]
+        completion_logprobs = token_lp[i, p_len - 1: s_len - 1]
+        results_lp.append(completion_logprobs.sum())
 
-        valid_lp = token_lp[i, :seq_len - 1]
-        masked = valid_lp * mask.float()
-        results.append(masked.sum() / mask.sum().float().clamp(min=1))
+        if compute_sft:
+            sft_loss_total -= completion_logprobs.sum()
+            sft_tokens += completion_logprobs.numel()
 
-    return results
+    sft_loss = (sft_loss_total / sft_tokens) if (compute_sft and sft_tokens > 0) else None
 
+    if no_grad:
+        results_lp = [lp.detach() for lp in results_lp]
 
-def batched_sft_loss(model, tokenizer, prompts, completions, max_len, accelerator):
-    encoded_full, prompt_lengths = [], []
-    for p, c in zip(prompts, completions):
-        encoded_full.append(
-            tokenizer(p + c, return_tensors="pt", truncation=True, max_length=max_len, add_special_tokens=False))
-        prompt_lengths.append(
-            tokenizer(p, return_tensors="pt", truncation=True, max_length=max_len, add_special_tokens=False)[
-                "input_ids"].shape[1])
-
-    batch_size = len(prompts)
-    max_full_len = max(e["input_ids"].shape[1] for e in encoded_full)
-
-    padded_ids = torch.full((batch_size, max_full_len), tokenizer.pad_token_id, dtype=torch.long,
-                            device=accelerator.device)
-    padded_attn = torch.zeros((batch_size, max_full_len), dtype=torch.long, device=accelerator.device)
-    labels = torch.full((batch_size, max_full_len), -100, dtype=torch.long, device=accelerator.device)
-
-    for i, (enc, p_len) in enumerate(zip(encoded_full, prompt_lengths)):
-        seq_len = enc["input_ids"].shape[1]
-        padded_ids[i, :seq_len] = enc["input_ids"].squeeze(0)
-        padded_attn[i, :seq_len] = enc["attention_mask"].squeeze(0)
-        labels[i, p_len - 1:seq_len - 1] = enc["input_ids"].squeeze(0)[p_len:seq_len]
-
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        loss = model(input_ids=padded_ids, attention_mask=padded_attn, labels=labels).loss
-    return loss
+    return results_lp, sft_loss
 
 
 # ---------------------------------------------------------------------------
-# Main Training Loop
+# Training phase
 # ---------------------------------------------------------------------------
-def main(cfg: FrameworkConfig):
-    # Accelerator initializes distributed training (DeepSpeed ZeRO, DDP, etc.)
-    accelerator = Accelerator(gradient_accumulation_steps=cfg.grad_accumulation_steps)
-    set_seed(42)
+def run_training_phase(
+        valid_examples: list[TrainingExample],
+        model,
+        ref_model,
+        processor,
+        cfg: FrameworkConfig,
+        optimizer,
+        scheduler,
+        global_step: int,
+        accelerator: Accelerator,
+) -> int:
+    sub_batches = [
+        valid_examples[i: i + cfg.batch_size]
+        for i in range(0, len(valid_examples), cfg.batch_size)
+    ]
 
-    accelerator.print("[Init] Loading model and tokenizer...")
-    model, tokenizer = load_model_and_tokenizer(cfg)
-
-    # Load Semantic Guardrail on local device
-    guardrail_encoder = SentenceTransformer(cfg.semantic_model_name, device=accelerator.device)
-    judge_system_prompt = build_judge_system_prompt(cfg.judge_criteria)
-
-    dataset = RLHFDataset(cfg.data_path)
-    dataloader = DataLoader(dataset, batch_size=cfg.inference_batch_size, shuffle=True)
-
-    optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.01)
-    scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
-        optimizer, num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=len(dataloader) * cfg.num_epochs, num_cycles=cfg.num_epochs
+    accelerator.unwrap_model(model).gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    # Accelerator wraps objects to handle batch sharding and gradient syncs automatically
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    for sb_idx, sub_batch in enumerate(sub_batches):
+        accelerator.print(f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {len(sub_batch)} examples")
+
+        dpo_prompts = [ex.dpo_prompt for ex in sub_batch]
+        chosen_completions = [ex.chosen_completion for ex in sub_batch]
+        rejected_completions = [ex.rejected_completion for ex in sub_batch]
+        reward_weights = [ex.reward_weight for ex in sub_batch]
+        images_list = [ex.question_image for ex in sub_batch]
+
+        # ── Ref log-probs (no grad, ref model) ──────────────────────
+        ref_model.eval()
+        ref_lp_chosen, _ = compute_logprobs_and_sft(
+            ref_model, processor, dpo_prompts, chosen_completions, images_list, cfg.max_seq_len, compute_sft=False,
+            no_grad=True
+        )
+        ref_lp_rejected, _ = compute_logprobs_and_sft(
+            ref_model, processor, dpo_prompts, rejected_completions, images_list, cfg.max_seq_len, compute_sft=False,
+            no_grad=True
+        )
+        release_vram(accelerator, f"sub-batch {sb_idx + 1} ref logprobs")
+
+        # ── Policy log-probs + SFT (with grad, default model) ───────
+        model.train()
+
+        with accelerator.accumulate(model):
+            pol_lp_chosen, loss_sft = compute_logprobs_and_sft(
+                model, processor, dpo_prompts, chosen_completions, images_list, cfg.max_seq_len, compute_sft=True,
+                no_grad=False
+            )
+            pol_lp_rejected, _ = compute_logprobs_and_sft(
+                model, processor, dpo_prompts, rejected_completions, images_list, cfg.max_seq_len, compute_sft=False,
+                no_grad=False
+            )
+
+            loss_dpo = dpo_loss_weighted_batch(
+                ref_lp_chosen, ref_lp_rejected,
+                pol_lp_chosen, pol_lp_rejected,
+                beta=cfg.dpo_beta,
+                reward_weights=reward_weights,
+            )
+
+            loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
+
+            # Accelerate natively handles scaling loss by accumulation steps
+            accelerator.backward(loss)
+
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        # Only log properly when gradients actually stepped
+        if accelerator.sync_gradients:
+            global_step += 1
+            accelerator.print(f"  Step {global_step:4d} | loss={loss.item():.4f}")
+
+            # Online sync: Update ref_model weights periodically
+            if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_ref = accelerator.unwrap_model(ref_model)
+                unwrapped_ref.load_state_dict(unwrapped_model.state_dict())
+                accelerator.print(f"[Ref] Synced reference model across GPUs.")
+
+        del ref_lp_chosen, ref_lp_rejected
+        del pol_lp_chosen, pol_lp_rejected
+        del loss_dpo, loss
+        release_vram(accelerator, f"sub-batch {sb_idx + 1} post-backward")
+
+    accelerator.unwrap_model(model).gradient_checkpointing_disable()
+    release_vram(accelerator, "end of training phase")
+
+    return global_step
+
+
+# ---------------------------------------------------------------------------
+# Online training loop
+# ---------------------------------------------------------------------------
+def train_online(
+        model,
+        ref_model,
+        processor,
+        raw_data: list[dict],
+        guardrail: SemanticGuardrail,
+        cfg: FrameworkConfig,
+        accelerator: Accelerator,
+) -> None:
+    if accelerator.is_main_process:
+        os.makedirs(cfg.output_dir, exist_ok=True)
+
+    accelerator.unwrap_model(model).gradient_checkpointing_disable()
+    judge_system_prompt = build_judge_system_prompt(cfg.judge_criteria)
+
+    optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.01)
+    placeholder_total = max(1, cfg.cosine_cycle_steps * cfg.num_epochs)
+    scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=cfg.warmup_steps,
+        num_training_steps=placeholder_total,
+        num_cycles=cfg.num_epochs,
+    )
+
+    # Prepare all artifacts via Accelerate for DeepSpeed/DDP wrapping
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    ref_model = accelerator.prepare(ref_model)
+
+    # Shard Data so each GPU works on its own parallel partition
+    epoch_data = raw_data[accelerator.process_index:: accelerator.num_processes]
 
     global_step = 0
 
     for epoch in range(cfg.num_epochs):
         accelerator.print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{cfg.num_epochs}\n{'=' * 60}")
 
-        for batch_idx, batch in enumerate(dataloader):
-            questions = batch["question"]
-            golds = batch["gold"]
+        epoch_data = random.sample(epoch_data, len(epoch_data))
+        skipped = 0
+        optimizer.zero_grad()
 
-            # ---------------- 1. INFERENCE PHASE (Generation) ----------------
-            accelerator.unwrap_model(model).set_adapter("default")
-            model.eval()
-
-            generated_raw = generate_answers_batch(model, tokenizer, questions, cfg, accelerator)
-            clean_gens = [strip_thinking(g) for g in generated_raw]
-
-            # ---------------- 2. GUARDRAIL PHASE ----------------
-            gen_embs = guardrail_encoder.encode(clean_gens, convert_to_tensor=True)
-            gold_embs = guardrail_encoder.encode(golds, convert_to_tensor=True)
-            cosine_scores = F.cosine_similarity(gen_embs, gold_embs)
-
-            passing_idx = []
-            for i in range(len(questions)):
-                sim = cosine_scores[i].item()
-                try:
-                    same_lang = detect(clean_gens[i]) == detect(golds[i])
-                except:
-                    same_lang = False
-                if sim >= cfg.min_cosine_similarity and same_lang:
-                    passing_idx.append(i)
-
-            if not passing_idx:
-                continue
-
-            pass_questions = [questions[i] for i in passing_idx]
-            pass_clean_gens = [clean_gens[i] for i in passing_idx]
-            pass_golds = [golds[i] for i in passing_idx]
-
-            # ---------------- 3. JUDGING PHASE ----------------
-            judge_results = judge_answers_batch(
-                model, tokenizer, pass_questions, pass_clean_gens, pass_golds, cfg, judge_system_prompt, accelerator
+        for inf_start in range(0, len(epoch_data), cfg.inference_batch_size):
+            inf_items = epoch_data[inf_start: inf_start + cfg.inference_batch_size]
+            accelerator.print(
+                f"\n[GPU {accelerator.process_index} Epoch {epoch + 1} | Inference items "
+                f"{inf_start + 1}–{inf_start + len(inf_items)}/{len(epoch_data)}]"
             )
 
-            valid_examples = []
-            for rank, orig_idx in enumerate(passing_idx):
-                scores_generated, scores_gs = judge_results[rank]
-                base_weight_gen = aggregate_score(scores_generated, cfg)
-                base_weight_gs = aggregate_score(scores_gs, cfg)
+            # ── INFERENCE PHASE ─────
+            examples = run_inference_phase(
+                inf_items, model, processor, guardrail, cfg, judge_system_prompt, accelerator
+            )
 
-                score_delta = abs(base_weight_gen - base_weight_gs)
-                think_bonus = cfg.thinking_bonus if has_thinking(generated_raw[orig_idx], tokenizer,
-                                                                 cfg.min_think_tokens) else 0.0
-                reward_weight = min(1.0, max(max(base_weight_gen, base_weight_gs), score_delta + think_bonus))
+            valid_examples = [ex for ex in examples if ex is not None]
+            skipped += sum(1 for ex in examples if ex is None)
 
-                if base_weight_gen >= base_weight_gs:
-                    chosen, rejected = generated_raw[orig_idx], golds[orig_idx]
-                else:
-                    chosen, rejected = golds[orig_idx], generated_raw[orig_idx]
+            if not valid_examples:
+                accelerator.print("[Batch] All items discarded by guardrail — skipping.")
+                continue
 
-                sft_user = f"QUESTION:\n{questions[orig_idx]}\n\nANSWER 1:\n{pass_clean_gens[rank]}\n\nANSWER 2:\n{golds[orig_idx]}"
-                judge_prompt = tokenizer.apply_chat_template(
-                    [{"role": "system", "content": judge_system_prompt}, {"role": "user", "content": sft_user}],
-                    tokenize=False, add_generation_prompt=True
-                )
-                judge_response = json.dumps({"ANSWER 1": scores_generated, "ANSWER 2": scores_gs}, ensure_ascii=False)
+            release_vram(accelerator, "between inference and training phases")
 
-                valid_examples.append({
-                    "q": questions[orig_idx], "chosen": chosen, "rejected": rejected,
-                    "weight": reward_weight, "j_prompt": judge_prompt, "j_resp": judge_response
-                })
+            # ── TRAINING PHASE ────────
+            accelerator.print(
+                f"[Train] {len(valid_examples)} valid examples → "
+                f"{(len(valid_examples) + cfg.batch_size - 1) // cfg.batch_size} sub-batches "
+                f"of up to {cfg.batch_size}"
+            )
 
-            # ---------------- 4. TRAINING PHASE ----------------
-            sub_batches = [valid_examples[i: i + cfg.batch_size] for i in range(0, len(valid_examples), cfg.batch_size)]
+            global_step = run_training_phase(
+                valid_examples, model, ref_model, processor, cfg,
+                optimizer, scheduler, global_step, accelerator
+            )
 
-            # Accelerate natively handles gradient checkpointing if configured
-            model.train()
+        accelerator.print(
+            f"\n[Epoch {epoch + 1}] GPU {accelerator.process_index} Skipped {skipped}/{len(epoch_data)} items.")
 
-            for sub_batch in sub_batches:
-                # 'accumulate' gracefully abstracts away grad accumulation math and DeepSpeed boundaries
-                with accelerator.accumulate(model):
-                    prompts = [build_dpo_prompt(ex["q"], tokenizer) for ex in sub_batch]
-                    chosen = [ex["chosen"] for ex in sub_batch]
-                    rejected = [ex["rejected"] for ex in sub_batch]
-                    weights = torch.tensor([ex["weight"] for ex in sub_batch], device=accelerator.device)
-                    j_prompts = [ex["j_prompt"] for ex in sub_batch]
-                    j_resps = [ex["j_resp"] for ex in sub_batch]
-
-                    # --- Ref pass (no_grad) ---
-                    accelerator.unwrap_model(model).set_adapter("ref")
-                    model.eval()
-                    ref_lps = batched_log_probs(model, tokenizer, prompts * 2, chosen + rejected, cfg.max_seq_len,
-                                                accelerator, no_grad=True)
-                    # Detach removes the graph so memory is instantly freed
-                    ref_chosen = torch.stack([t.detach() for t in ref_lps[:len(chosen)]])
-                    ref_rejected = torch.stack([t.detach() for t in ref_lps[len(chosen):]])
-
-                    # --- Policy pass (grad) ---
-                    accelerator.unwrap_model(model).set_adapter("default")
-                    model.train()
-                    pol_lps = batched_log_probs(model, tokenizer, prompts * 2, chosen + rejected, cfg.max_seq_len,
-                                                accelerator, no_grad=False)
-                    pol_chosen = torch.stack(pol_lps[:len(chosen)])
-                    pol_rejected = torch.stack(pol_lps[len(chosen):])
-
-                    # --- DPO Loss ---
-                    chosen_ratio = pol_chosen - ref_chosen
-                    rejected_ratio = pol_rejected - ref_rejected
-                    margin = cfg.dpo_beta * (chosen_ratio - rejected_ratio) * weights
-                    loss_dpo = -F.logsigmoid(margin).mean()
-
-                    # --- SFT Loss ---
-                    loss_sft = batched_sft_loss(model, tokenizer, j_prompts, j_resps, cfg.max_seq_len, accelerator)
-
-                    # --- Total Loss & Backward ---
-                    loss = loss_dpo + cfg.sft_loss_weight * loss_sft
-                    accelerator.backward(loss)
-
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-
-            # Using accelerator.sync_gradients tells us if a full gradient accumulation boundary was crossed
-            if accelerator.sync_gradients:
-                global_step += 1
-                accelerator.print(f"Step {} | Loss: {loss.item():.4f}")
-
-                if global_step % cfg.ref_update_interval == 0:
-                    sync_ref_model(model, accelerator)
-
-        # ---------------- SAVE CHECKPOINT ----------------
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             ckpt = f"{cfg.output_dir}/epoch_{epoch + 1}"
-            accelerator.unwrap_model(model).save_pretrained(ckpt)
-            tokenizer.save_pretrained(ckpt)
-            accelerator.print(f"[Checkpoint] Saved to {}")
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(ckpt)
+            processor.save_pretrained(ckpt)
+            accelerator.print(f"[Checkpoint] Saved to {ckpt}")
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+# def load_jsonl(path: str) -> list[dict]:
+#     with open(path, "r", encoding="utf-8") as f:
+#         return [json.loads(line) for line in f]
+
+def load_json(path: str) -> list[dict]:
+     with open(path, encoding="utf-8") as f:
+         return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main(cfg: FrameworkConfig):
+    accelerator = Accelerator()
+
+    accelerator.print("[Init] Loading model and processor...")
+    model, ref_model, processor = load_models_and_processor(cfg, accelerator)
+
+    accelerator.print("[Init] Loading semantic guardrail...")
+    guardrail = SemanticGuardrail(cfg.semantic_model_name, device=accelerator.device)
+
+    accelerator.print(f"[Data] Reading {cfg.data_path}...")
+    raw_data = load_json(cfg.data_path)
+    accelerator.print(f"[Data] {len(raw_data)} raw examples loaded.")
+
+    train_online(model, ref_model, processor, raw_data, guardrail, cfg, accelerator)
+    accelerator.print("\n[Done] Training complete.")
 
 
 if __name__ == "__main__":
-    cfg = FrameworkConfig()
+    cfg = FrameworkConfig(
+        model_name="google/gemma-3-12b-it",
+        #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
+        data_path = "/home/matejm/test_curated_final/test_data_qa.json",
+        num_epochs=1,
+        inference_batch_size=16,  # generate batch
+        max_judge_batch_size=4,  # judge batch at a time
+        batch_size=1,  # train 2 at a time (per-GPU)
+        output_dir="./checkpoints_meta_learning",
+        ref_update_interval=100,
+    )
     main(cfg)
+
+# accelerate launch --config_file accelerate_config.yaml train_deepspeed.py
