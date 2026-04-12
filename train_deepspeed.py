@@ -298,9 +298,9 @@ def judge_answers_batch(
                      "content": [{"type": "text", "text": judge_system_prompt + user_content}]}
                 ]
             batch_messages.append(msg)
-            #accelerator.print("---------------------Generated text:\n----------------------")
-            #accelerator.print(judge_system_prompt + user_content)
-            #accelerator.print("------------------------------------------------------------")
+            accelerator.print("---------------------Generated text:\n----------------------")
+            accelerator.print(judge_system_prompt + user_content)
+            accelerator.print("------------------------------------------------------------")
 
         # Set padding side to left for generation
         processor.tokenizer.padding_side = "left"
@@ -337,9 +337,9 @@ def judge_answers_batch(
             raw = processor.tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
 
             try:
-                #accelerator.print('----------------------------JUDGE------------------------------')
-                #accelerator.print(raw)
-                #accelerator.print('----------------------------JUDGE------------------------------')
+                accelerator.print('----------------------------JUDGE------------------------------')
+                accelerator.print(raw)
+                accelerator.print('----------------------------JUDGE------------------------------')
                 cleaned = raw.replace("```json", "").replace("```", "").strip()
                 scores = json.loads(cleaned)
                 scores_generated = scores[generated_key]
@@ -502,9 +502,6 @@ def run_inference_phase(
     output: list[Optional[TrainingExample]] = [None] * len(items)
 
     for rank, orig_idx in enumerate(all_idx):
-        if orig_idx in filtered_idx:
-            continue
-
         scores_generated, scores_gs = judge_results[rank]
         base_weight_gen = aggregate_score(scores_generated, cfg)
         base_weight_gs = aggregate_score(scores_gs, cfg)
@@ -795,6 +792,9 @@ def train_online(
     accelerator.unwrap_model(model).gradient_checkpointing_disable()
     judge_system_prompt = build_judge_system_prompt(cfg.judge_criteria)
 
+    min_len = (len(raw_data) // accelerator.num_processes) * accelerator.num_processes
+    raw_data = raw_data[:min_len]
+
     optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.01)
     placeholder_total = max(1, cfg.cosine_cycle_steps * cfg.num_epochs)
     scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
@@ -900,7 +900,7 @@ if __name__ == "__main__":
     cfg = FrameworkConfig(
         model_name="google/gemma-3-12b-it",
         #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
-        data_path = "/home/matejm/test_curated_final/test_data_qa.json",
+        data_path = "/home/matejm/test_curated_final/test_data_coordinates.json",
         num_epochs=1,
         inference_batch_size=32,  # generate batch
         max_judge_batch_size=8,  # judge batch at a time
