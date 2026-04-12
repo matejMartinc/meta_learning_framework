@@ -18,6 +18,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from torch.optim import AdamW
 from langdetect import detect
+from peft import LoraConfig, get_peft_model
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -116,43 +117,42 @@ def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    accelerator.print("[Init] Loading policy model...")
-    model = AutoModelForImageTextToText.from_pretrained(
+    accelerator.print("[Init] Loading base model...")
+    base_model = AutoModelForImageTextToText.from_pretrained(
         cfg.model_name,
         dtype=torch.bfloat16,
         attn_implementation="flash_attention_2"
     )
 
-    # Freeze vision tower for policy model
+    # 1. Define LoRA Config
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+
+    accelerator.print("[Init] Injecting Policy & Reference Adapters...")
+    # 2. Wrap model and create the first adapter ("policy")
+    model = get_peft_model(base_model, lora_config, adapter_name="policy")
+
+    # 3. Add the second adapter ("reference")
+    model.add_adapter("reference", lora_config)
+
+    # 4. Set requires_grad rules
     for name, param in model.named_parameters():
-        if "vision" in name.lower() or "vit" in name.lower():
-            param.requires_grad_(False)
+        if "reference" in name:
+            param.requires_grad_(False)  # Ref adapter is frozen during training
+        elif "policy" in name:
+            param.requires_grad_(True)  # Policy adapter is trained
+        else:
+            param.requires_grad_(False)  # Base model is frozen
+
+    return model, processor
 
 
-    accelerator.print("[Init] Loading frozen reference model...")
-    ref_model = AutoModelForImageTextToText.from_pretrained(
-        cfg.model_name,
-        dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2"
-    )
-    for param in ref_model.parameters():
-        param.requires_grad_(False)
-    ref_model.eval()
-
-    return model, ref_model, processor
-
-
-# ---------------------------------------------------------------------------
-# Padding-side context manager
-# ---------------------------------------------------------------------------
-@contextmanager
-def left_padding(processor: AutoProcessor):
-    original = processor.tokenizer.padding_side
-    processor.tokenizer.padding_side = "left"
-    try:
-        yield
-    finally:
-        processor.tokenizer.padding_side = original
 
 
 # ---------------------------------------------------------------------------
@@ -180,32 +180,35 @@ def generate_answers_batch(
 ) -> list[str]:
     prompt_sys = "Always respond in a grammatically correct manner using correct noun-adjective gender/number agreement, even if the question contains typos or other grammatically incorrect words.\nCRITICAL: Always respond in the SAME LANGUAGE as the user's question.\nProvide your answer to the question below. \nQuestion:\n"
 
-    prompts_text = []
-    batch_images = []
-
+    batch_messages = []
     for q in questions:
-        content_list = []
-        if q["image"] is not None:
-            content_list.append({"type": "image"})
-            batch_images.append(q["image"])
-
-        # Clean explicit image tags if they exist to pass cleanly to Chat Template framework
         clean_text = q["text"].replace("<image>\n", "").replace("<image>", "")
-        content_list.append({"type": "text", "text": prompt_sys + clean_text})
+        if q["image"] is not None:
+            msg = [
+                {"role": "user",
+                 "content": [{"type": "image", "image": q["image"]}, {"type": "text", "text": prompt_sys + clean_text}]}
+            ]
+        else:
+            msg = [
+                {"role": "user",
+                 "content": [{"type": "text", "text": prompt_sys + clean_text}]}
+            ]
+        batch_messages.append(msg)
 
-        msgs = [{"role": "system", "content": ""}, {"role": "user", "content": content_list}]
-        prompts_text.append(processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+    # Set padding side to left for generation
+    processor.tokenizer.padding_side = "left"
 
-    with left_padding(processor):
-        inputs = processor(
-            text=prompts_text,
-            images=batch_images if batch_images else None,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            add_special_tokens=False,
-            max_length=1536,  # Avoid heavy truncation on prompt to preserve images
-        ).to(accelerator.device)
+    # Process the batch
+    inputs = processor.apply_chat_template(
+        batch_messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        padding=True,  # Required for batches
+        return_dict=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt"
+    ).to(accelerator.device)
 
     input_len = inputs["input_ids"].shape[1]
 
@@ -279,31 +282,40 @@ def judge_answers_batch(
             else:
                 chunk_orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
 
-        chunk_prompts = []
-        batch_images = []
+        batch_messages = []
         for q_dict, (a1, a2, _, _) in zip(chunk_questions, chunk_orderings):
-            content_list = []
-            if q_dict["image"] is not None:
-                content_list.append({"type": "image"})
-                batch_images.append(q_dict["image"])
-
             clean_text = q_dict["text"].replace("<image>\n", "").replace("<image>", "")
             user_content = f"QUESTION:\n{clean_text}\n\nANSWER 1:\n{a1}\n\nANSWER 2:\n{a2}"
-            content_list.append({"type": "text", "text": user_content})
+            if q_dict["image"] is not None:
+                msg = [
+                    {"role": "user",
+                     "content": [{"type": "image", "image": q_dict["image"]},
+                                 {"type": "text", "text": judge_system_prompt + user_content}]}
+                ]
+            else:
+                msg = [
+                    {"role": "user",
+                     "content": [{"type": "text", "text": judge_system_prompt + user_content}]}
+                ]
+            batch_messages.append(msg)
+            #accelerator.print("---------------------Generated text:\n----------------------")
+            #accelerator.print(judge_system_prompt + user_content)
+            #accelerator.print("------------------------------------------------------------")
 
-            msgs = [{"role": "system", "content": judge_system_prompt}, {"role": "user", "content": content_list}]
-            chunk_prompts.append(processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+        # Set padding side to left for generation
+        processor.tokenizer.padding_side = "left"
 
-        with left_padding(processor):
-            inputs = processor(
-                text=chunk_prompts,
-                images=batch_images if batch_images else None,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                add_special_tokens=False,
-                max_length=cfg.max_seq_len,
-            ).to(accelerator.device)
+        # Process the batch
+        inputs = processor.apply_chat_template(
+            batch_messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            padding=True,  # Required for batches
+            truncation=True,
+            max_length=cfg.max_seq_len,
+            return_dict=True,
+            return_tensors="pt"
+        ).to(accelerator.device)
 
         input_length = inputs["input_ids"].shape[1]
 
@@ -325,6 +337,9 @@ def judge_answers_batch(
             raw = processor.tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
 
             try:
+                #accelerator.print('----------------------------JUDGE------------------------------')
+                #accelerator.print(raw)
+                #accelerator.print('----------------------------JUDGE------------------------------')
                 cleaned = raw.replace("```json", "").replace("```", "").strip()
                 scores = json.loads(cleaned)
                 scores_generated = scores[generated_key]
@@ -430,26 +445,34 @@ def run_inference_phase(
         judge_system_prompt: str,
         accelerator: Accelerator,
 ) -> list[Optional[TrainingExample]]:
+    base_data_dir = os.path.dirname(cfg.data_path)
     questions, golds = [], []
     for item in items:
-        convs = item.get("conversations", [])
+        raw_convs = item.get("conversations", [])
+        if len(raw_convs) > 0 and isinstance(raw_convs[0], list):
+            convs = raw_convs[0]
+        else:
+            convs = raw_convs
         q_text = convs[0]["value"] if len(convs) >= 1 else ""
         g_text = convs[1]["value"] if len(convs) >= 2 else ""
 
-        img_path = item.get("image")
-        img_obj = None
-        if img_path and os.path.exists(img_path):
+        if "image" in item:
+            img_path = os.path.join(base_data_dir, item.get("image"))
             try:
                 img_obj = Image.open(img_path).convert("RGB")
             except Exception as e:
-                accelerator.print(f"[Warning] Failed to load image {img_path}: {e}")
-
+                accelerator.print(f"[Warning] Failed to open image {img_path}")
+        else:
+            img_obj = None
         questions.append({"text": q_text, "image": img_obj})
         golds.append(g_text)
 
     # ── Phase 1: generation ──────────────────────────────────────────────
     accelerator.print(f"[Inference] Generating answers for {len(questions)} questions …")
     model.eval()
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.set_adapter("policy")
 
     generated_raw = generate_answers_batch(model, processor, questions, cfg, accelerator)
 
@@ -566,7 +589,11 @@ def compute_logprobs_and_sft(
         compute_sft: bool = False,
         no_grad: bool = False,
 ):
-    batch_imgs = [img for img in images_list if img is not None]
+    # Determine if there are ANY images in this training batch
+    has_any_image = any(img is not None for img in images_list)
+
+    # Pad images so the length matches the text length exactly
+    batch_imgs = [[img] if img is not None else [] for img in images_list]
 
     # Right padding naturally isolates targets at the end
     original_pad_side = processor.tokenizer.padding_side
@@ -574,7 +601,7 @@ def compute_logprobs_and_sft(
 
     enc_f_batch = processor(
         text=[p + c for p, c in zip(prompts, completions)],
-        images=batch_imgs if batch_imgs else None,
+        images=batch_imgs if has_any_image else None,
         return_tensors="pt",
         padding=True,
         truncation=True,
@@ -641,7 +668,6 @@ def compute_logprobs_and_sft(
 def run_training_phase(
         valid_examples: list[TrainingExample],
         model,
-        ref_model,
         processor,
         cfg: FrameworkConfig,
         optimizer,
@@ -668,19 +694,27 @@ def run_training_phase(
         images_list = [ex.question_image for ex in sub_batch]
 
         # ── Ref log-probs (no grad, ref model) ──────────────────────
-        ref_model.eval()
-        ref_lp_chosen, _ = compute_logprobs_and_sft(
-            ref_model, processor, dpo_prompts, chosen_completions, images_list, cfg.max_seq_len, compute_sft=False,
-            no_grad=True
-        )
-        ref_lp_rejected, _ = compute_logprobs_and_sft(
-            ref_model, processor, dpo_prompts, rejected_completions, images_list, cfg.max_seq_len, compute_sft=False,
-            no_grad=True
-        )
+        # Ensure we are working with the raw model interface for PEFT adapter switching
+        unwrapped_model = accelerator.unwrap_model(model)
+
+        # ── Ref log-probs (no grad, reference adapter) ──────────────────────
+        model.eval()
+        unwrapped_model.set_adapter("reference")  # Switch to Reference
+
+        with torch.no_grad():
+            ref_lp_chosen, _ = compute_logprobs_and_sft(
+                model, processor, dpo_prompts, chosen_completions, images_list, cfg.max_seq_len, compute_sft=False,
+                no_grad=True
+            )
+            ref_lp_rejected, _ = compute_logprobs_and_sft(
+                model, processor, dpo_prompts, rejected_completions, images_list, cfg.max_seq_len, compute_sft=False,
+                no_grad=True
+            )
         release_vram(accelerator, f"sub-batch {sb_idx + 1} ref logprobs")
 
-        # ── Policy log-probs + SFT (with grad, default model) ───────
+        # ── Policy log-probs + SFT (with grad, policy adapter) ───────
         model.train()
+        unwrapped_model.set_adapter("policy")  # Switch back to Policy
 
         with accelerator.accumulate(model):
             pol_lp_chosen, loss_sft = compute_logprobs_and_sft(
@@ -716,13 +750,22 @@ def run_training_phase(
             global_step += 1
             accelerator.print(f"  Step {global_step:4d} | loss={loss.item():.4f}")
 
-            # Online sync: Update ref_model weights periodically
+            # ── ONLINE SYNC: Copy Policy weights to Reference weights ──
             if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
                 accelerator.wait_for_everyone()
-                unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_ref = accelerator.unwrap_model(ref_model)
-                unwrapped_ref.load_state_dict(unwrapped_model.state_dict())
-                accelerator.print(f"[Ref] Synced reference model across GPUs.")
+
+                with torch.no_grad():
+                    state_dict = unwrapped_model.state_dict()
+                    for name, param in unwrapped_model.named_parameters():
+                        if "reference" in name:
+                            # Find the matching policy parameter name
+                            policy_name = name.replace("reference", "policy")
+                            if policy_name in state_dict:
+                                # Copy data directly (this is completely safe under DeepSpeed ZeRO
+                                # because local shard shapes match perfectly across adapters)
+                                param.data.copy_(state_dict[policy_name].data)
+
+                accelerator.print(f"[Ref] Synced policy adapter to reference adapter across GPUs.")
 
         del ref_lp_chosen, ref_lp_rejected
         del pol_lp_chosen, pol_lp_rejected
@@ -740,7 +783,6 @@ def run_training_phase(
 # ---------------------------------------------------------------------------
 def train_online(
         model,
-        ref_model,
         processor,
         raw_data: list[dict],
         guardrail: SemanticGuardrail,
@@ -764,7 +806,6 @@ def train_online(
 
     # Prepare all artifacts via Accelerate for DeepSpeed/DDP wrapping
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
-    ref_model = accelerator.prepare(ref_model)
 
     # Shard Data so each GPU works on its own parallel partition
     epoch_data = raw_data[accelerator.process_index:: accelerator.num_processes]
@@ -807,7 +848,7 @@ def train_online(
             )
 
             global_step = run_training_phase(
-                valid_examples, model, ref_model, processor, cfg,
+                valid_examples, model, processor, cfg,
                 optimizer, scheduler, global_step, accelerator
             )
 
@@ -842,16 +883,16 @@ def main(cfg: FrameworkConfig):
     accelerator = Accelerator()
 
     accelerator.print("[Init] Loading model and processor...")
-    model, ref_model, processor = load_models_and_processor(cfg, accelerator)
+    model, processor = load_models_and_processor(cfg, accelerator)
 
     accelerator.print("[Init] Loading semantic guardrail...")
-    guardrail = SemanticGuardrail(cfg.semantic_model_name, device=accelerator.device)
+    guardrail = SemanticGuardrail(cfg.semantic_model_name, device="cpu")
 
     accelerator.print(f"[Data] Reading {cfg.data_path}...")
     raw_data = load_json(cfg.data_path)
     accelerator.print(f"[Data] {len(raw_data)} raw examples loaded.")
 
-    train_online(model, ref_model, processor, raw_data, guardrail, cfg, accelerator)
+    train_online(model, processor, raw_data, guardrail, cfg, accelerator)
     accelerator.print("\n[Done] Training complete.")
 
 
@@ -861,9 +902,9 @@ if __name__ == "__main__":
         #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
         data_path = "/home/matejm/test_curated_final/test_data_qa.json",
         num_epochs=1,
-        inference_batch_size=16,  # generate batch
-        max_judge_batch_size=4,  # judge batch at a time
-        batch_size=1,  # train 2 at a time (per-GPU)
+        inference_batch_size=32,  # generate batch
+        max_judge_batch_size=8,  # judge batch at a time
+        batch_size=4,  # train 2 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
     )
