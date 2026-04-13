@@ -2,7 +2,7 @@ Bootstrap: docker
 From: pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
 
 %post
-    pip install transformers peft evaluate datasets tokenizers numpy pandas nltk sentencepiece sentence_transformers torchvision ninja huggingface-hub deepspeed ujson Pillow accelerate langdetect
+    pip install transformers peft evaluate datasets tokenizers numpy pandas nltk sentencepiece sentence_transformers torchvision ninja huggingface-hub deepspeed ujson Pillow accelerate langdetect flash-attn
 
 
 %environment

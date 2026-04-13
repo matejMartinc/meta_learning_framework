@@ -923,9 +923,9 @@ if __name__ == "__main__":
         #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
         data_path = "data/train_gams_nemotron.jsonl",
         num_epochs=1,
-        inference_batch_size=64,  # generate batch
-        max_judge_batch_size=16,  # judge batch at a time
-        batch_size=4,  # train 2 at a time (per-GPU)
+        inference_batch_size=128,  # generate batch
+        max_judge_batch_size=32,  # judge batch at a time
+        batch_size=8,  # train 2 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
     )
