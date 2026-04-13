@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
+
+%post
+    pip install transformers peft evaluate datasets tokenizers numpy pandas nltk sentencepiece sentence_transformers torchvision ninja huggingface-hub deepspeed ujson Pillow accelerate langdetect
+
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+    export WANDB_API_KEY=0371b79d28c3adb07413603f8d52a735ca4568f3
+    export WANDB_ENTITY=matejm
+    export WANDB_PROJECT=VLM
+
+%runscript
+    echo "Use this container to run torch."
+    wandb login

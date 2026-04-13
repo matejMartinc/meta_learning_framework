@@ -298,9 +298,9 @@ def judge_answers_batch(
                      "content": [{"type": "text", "text": judge_system_prompt + user_content}]}
                 ]
             batch_messages.append(msg)
-            accelerator.print("---------------------Generated text:\n----------------------")
-            accelerator.print(judge_system_prompt + user_content)
-            accelerator.print("------------------------------------------------------------")
+            #accelerator.print("---------------------Generated text:\n----------------------")
+            #accelerator.print(judge_system_prompt + user_content)
+            #accelerator.print("------------------------------------------------------------")
 
         # Set padding side to left for generation
         processor.tokenizer.padding_side = "left"
@@ -337,9 +337,9 @@ def judge_answers_batch(
             raw = processor.tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
 
             try:
-                accelerator.print('----------------------------JUDGE------------------------------')
-                accelerator.print(raw)
-                accelerator.print('----------------------------JUDGE------------------------------')
+                #accelerator.print('----------------------------JUDGE------------------------------')
+                #accelerator.print(raw)
+                #accelerator.print('----------------------------JUDGE------------------------------')
                 cleaned = raw.replace("```json", "").replace("```", "").strip()
                 scores = json.loads(cleaned)
                 scores_generated = scores[generated_key]
@@ -475,6 +475,14 @@ def run_inference_phase(
     unwrapped_model.set_adapter("policy")
 
     generated_raw = generate_answers_batch(model, processor, questions, cfg, accelerator)
+    #accelerator.print("---------------------Questions:\n----------------------")
+    #accelerator.print(questions)
+    #accelerator.print("---------------------Generated text:\n----------------------")
+    #accelerator.print(generated_raw)
+    #accelerator.print("---------------------GS text:\n----------------------")
+    #accelerator.print(golds)
+    #accelerator.print("------------------------------------------------------------")
+
 
     # ── Phase 2: semantic guardrail ──────────────────────────────────────
     keep_mask = guardrail.filter_batch(generated_raw, golds, cfg.min_cosine_similarity)
@@ -867,13 +875,13 @@ def train_online(
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-# def load_jsonl(path: str) -> list[dict]:
-#     with open(path, "r", encoding="utf-8") as f:
-#         return [json.loads(line) for line in f]
+def load_jsonl(path: str) -> list[dict]:
+     with open(path, "r", encoding="utf-8") as f:
+         return [json.loads(line) for line in f]
 
-def load_json(path: str) -> list[dict]:
-     with open(path, encoding="utf-8") as f:
-         return json.load(f)
+#def load_json(path: str) -> list[dict]:
+#     with open(path, encoding="utf-8") as f:
+#         return json.load(f)
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +897,7 @@ def main(cfg: FrameworkConfig):
     guardrail = SemanticGuardrail(cfg.semantic_model_name, device="cpu")
 
     accelerator.print(f"[Data] Reading {cfg.data_path}...")
-    raw_data = load_json(cfg.data_path)
+    raw_data = load_jsonl(cfg.data_path)
     accelerator.print(f"[Data] {len(raw_data)} raw examples loaded.")
 
     train_online(model, processor, raw_data, guardrail, cfg, accelerator)
@@ -900,11 +908,11 @@ if __name__ == "__main__":
     cfg = FrameworkConfig(
         model_name="google/gemma-3-12b-it",
         #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
-        data_path = "/home/matejm/test_curated_final/test_data_coordinates.json",
+        data_path = "data/train_gams_nemotron.jsonl",
         num_epochs=1,
         inference_batch_size=32,  # generate batch
         max_judge_batch_size=8,  # judge batch at a time
-        batch_size=4,  # train 2 at a time (per-GPU)
+        batch_size=2,  # train 2 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
     )
