@@ -793,6 +793,7 @@ def train_online(
         guardrail: SemanticGuardrail,
         cfg: FrameworkConfig,
         accelerator: Accelerator,
+        save_every_k_steps: int = 5000,  # New parameter
 ) -> None:
     if accelerator.is_main_process:
         os.makedirs(cfg.output_dir, exist_ok=True)
@@ -812,10 +813,7 @@ def train_online(
         num_cycles=cfg.num_epochs,
     )
 
-    # Prepare all artifacts via Accelerate for DeepSpeed/DDP wrapping
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
-
-    # Shard Data so each GPU works on its own parallel partition
     epoch_data = raw_data[accelerator.process_index:: accelerator.num_processes]
 
     global_step = 0
@@ -855,21 +853,36 @@ def train_online(
                 f"of up to {cfg.batch_size}"
             )
 
+            # We track the step count before and after to see if we crossed a 'k' threshold
+            previous_step = global_step
+
             global_step = run_training_phase(
                 valid_examples, model, processor, cfg,
                 optimizer, scheduler, global_step, accelerator
             )
 
+            # ── STEP-BASED CHECKPOINT ──
+            # Check if we passed a multiple of k during this training phase
+            if (global_step // save_every_k_steps) > (previous_step // save_every_k_steps):
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    ckpt = f"{cfg.output_dir}/step_{global_step}"
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.save_pretrained(ckpt)
+                    processor.save_pretrained(ckpt)
+                    accelerator.print(f"\n[Checkpoint] Step-based save at step {global_step} to {ckpt}")
+
         accelerator.print(
             f"\n[Epoch {epoch + 1}] GPU {accelerator.process_index} Skipped {skipped}/{len(epoch_data)} items.")
 
+        # ── EPOCH-BASED CHECKPOINT ──
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             ckpt = f"{cfg.output_dir}/epoch_{epoch + 1}"
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save_pretrained(ckpt)
             processor.save_pretrained(ckpt)
-            accelerator.print(f"[Checkpoint] Saved to {ckpt}")
+            accelerator.print(f"[Checkpoint] End of epoch save to {ckpt}")
 
 
 # ---------------------------------------------------------------------------
@@ -910,9 +923,9 @@ if __name__ == "__main__":
         #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
         data_path = "data/train_gams_nemotron.jsonl",
         num_epochs=1,
-        inference_batch_size=32,  # generate batch
-        max_judge_batch_size=8,  # judge batch at a time
-        batch_size=2,  # train 2 at a time (per-GPU)
+        inference_batch_size=64,  # generate batch
+        max_judge_batch_size=16,  # judge batch at a time
+        batch_size=4,  # train 2 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
     )
