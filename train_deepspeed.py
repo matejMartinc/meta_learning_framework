@@ -863,7 +863,7 @@ def train_online(
 
             # ── STEP-BASED CHECKPOINT ──
             # Check if we passed a multiple of k during this training phase
-            if (global_step // save_every_k_steps) > (previous_step // save_every_k_steps):
+            if ((global_step * cfg.batch_size) // save_every_k_steps) > ((previous_step * cfg.batch_size) // save_every_k_steps):
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     ckpt = f"{cfg.output_dir}/step_{global_step}"
