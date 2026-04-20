@@ -5,14 +5,14 @@ import google.generativeai as genai
 from typing import List, Dict
 
 # --- Configuration ---
-GOOGLE_API_KEY = "API-KEY"
+GOOGLE_API_KEY = "key"
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # List of your model result files (JSONL format)
 MODEL_RESULT_FILES = [
-    "results/gemma-3-12b-it_meta_improved_predictions.jsonl",
-    "results/gemma-3-12b-it_sft_predictions.jsonl",
-    #"results/gemma-3-12b-it_base_predictions.jsonl"
+    #"results/gemma-3-12b-it_meta_improved_predictions.jsonl",
+    "results/gemma-3-12b-it_meta_epoch_1_100k_predictions.jsonl",
+    "results/gemma-3-12b-it_base_predictions.jsonl"
 ]
 
 OUTPUT_FILE = "LLM_as_a_judge_scores.jsonl"
@@ -118,6 +118,7 @@ def main():
                 display_responses.append((display_name, pred_text))
 
             print(f"Evaluating ID: {item_id}...")
+            print(display_responses)
 
             eval_prompt = create_evaluation_prompt(
                 content['prompt'],
@@ -138,7 +139,7 @@ def main():
                 # Add metadata back so you know which model was which
                 parsed_json["id"] = item_id
                 parsed_json["model_mapping"] = mapping
-                print(parsed_json)
+                #print(parsed_json)
 
                 f_write.write(json.dumps(parsed_json, ensure_ascii=False) + '\n')
                 f_write.flush()  # Save progress frequently
