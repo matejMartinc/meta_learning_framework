@@ -35,7 +35,7 @@ class FrameworkConfig:
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj",
                                  "gate_proj", "up_proj", "down_proj"]
     )
-    data_path: str = "data/nemotron_sft_all_final_5k_sample.jsonl"
+    data_path: str = ""
     max_seq_len: int = 2048
     learning_rate: float = 2e-5
     num_epochs: int = 1
@@ -250,7 +250,7 @@ def main(cfg: FrameworkConfig):
 if __name__ == "__main__":
     cfg = FrameworkConfig(
         model_name="google/gemma-3-12b-it",
-        data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
+        data_path="data/train_gams_nemotron.jsonl",
         num_epochs=1,
         load_in_4bit=False,
         batch_size=1,

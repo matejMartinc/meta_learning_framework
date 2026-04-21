@@ -5,23 +5,23 @@ from peft import PeftModel
 
 # 1. Configuration
 base_model_id = "google/gemma-3-12b-it"  # Adjust if using 2b or 27b
-adapter_path = "checkpoints_meta_learning/epoch_1"
+adapter_path = "checkpoints_meta_learning/epoch_1_100k_examples"
 input_file = "data/gams_ft_dataset_1k_sample.jsonl"
-#output_file = "gemma-3-12b-it_meta_improved_predictions.jsonl"
-output_file = "gemma-3-12b-it_base.jsonl"
+output_file = "gemma-3-12b-it_meta_epoch_1_100k_examples.jsonl"
+#output_file = "gemma-3-12b-it_base.jsonl"
 
 # 2. Load Tokenizer and Model
 tokenizer = AutoTokenizer.from_pretrained(base_model_id)
 tokenizer.padding_side = 'left'  # Better for batch inference
 
-model = AutoModelForCausalLM.from_pretrained(
+base_model = AutoModelForCausalLM.from_pretrained(
     base_model_id,
     torch_dtype=torch.bfloat16,
     device_map="auto",
 )
 
 # 3. Load the LoRA Adapter
-#model = PeftModel.from_pretrained(base_model, adapter_path)
+model = PeftModel.from_pretrained(base_model, adapter_path)
 model.eval()
 
 

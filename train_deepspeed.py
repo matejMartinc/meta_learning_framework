@@ -918,7 +918,8 @@ def train_online(
                 if accelerator.is_main_process:
                     ckpt = f"{cfg.output_dir}/step_{global_step}"
                     unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_model.save_pretrained(ckpt)
+                    unwrapped_model.set_adapter("policy")
+                    unwrapped_model.save_pretrained(ckpt, selected_adapters=["policy"])
                     processor.save_pretrained(ckpt)
                     accelerator.print(f"\n[Checkpoint] Step-based save at step {global_step} to {ckpt}")
 
@@ -930,7 +931,8 @@ def train_online(
         if accelerator.is_main_process:
             ckpt = f"{cfg.output_dir}/epoch_{epoch + 1}"
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(ckpt)
+            unwrapped_model.set_adapter("policy")
+            unwrapped_model.save_pretrained(ckpt, selected_adapters=["policy"])
             processor.save_pretrained(ckpt)
             accelerator.print(f"[Checkpoint] End of epoch save to {ckpt}")
 
