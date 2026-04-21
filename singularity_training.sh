@@ -8,7 +8,7 @@
 #SBATCH --gpus=4                  # Number of GPUs per node
 #SBATCH --cpus-per-task=16
 #SBATCH --partition=e8
-#sbatch --nodelist=kt-gpu4
+#sbatch --nodelist=elixir,kt-gpu4
 
 
 export PATH=/usr/local/bin:$PATH

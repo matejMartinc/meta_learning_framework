@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import dataclasses
 import torch
 import torch.nn.functional as F
 from contextlib import contextmanager
@@ -68,6 +69,9 @@ class FrameworkConfig:
     max_new_tokens: int = 1024
     temperature: float = 0.7
     top_p: float = 0.9
+
+    # WandB
+    wandb_project: str = "gemma-online-training"
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +354,8 @@ def judge_answers_batch(
                     scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
 
                 results[global_idx] = (scores_generated, scores_gs)
-            except (json.JSONDecodeError, KeyError, ValueError):
-                accelerator.print(f"[Judge ] Parse failed for idx {global_idx} — using fallback.")
+            except Exception as e:
+                accelerator.print(f"[Judge ] Parse failed for idx {global_idx} — using fallback. Error:", e)
                 results[global_idx] = (
                     {k: 1 for k in cfg.judge_criteria},
                     {k: 5 for k in cfg.judge_criteria}
@@ -515,8 +519,9 @@ def run_inference_phase(
         base_weight_gs = aggregate_score(scores_gs, cfg)
 
         score_delta = abs(base_weight_gen - base_weight_gs)
-        score_chosen = max(base_weight_gen, base_weight_gs)
-        reward_weight = min(1.0, max(score_chosen, score_delta))
+        #score_chosen = max(base_weight_gen, base_weight_gs)
+        #reward_weight = min(1.0, max(score_chosen, score_delta))
+        reward_weight = min(1.0, score_delta)
 
         dpo_prompt = build_dpo_prompt(questions[orig_idx], processor)
 
@@ -647,8 +652,7 @@ def compute_logprobs_and_sft(
     token_lp = -ce_loss
 
     results_lp = []
-    sft_loss_total = 0.0
-    sft_tokens = 0
+    sft_losses_per_ex = []
 
     for i, p_len in enumerate(prompt_lengths):
         s_len = seq_lengths[i]
@@ -656,15 +660,18 @@ def compute_logprobs_and_sft(
         results_lp.append(completion_logprobs.sum())
 
         if compute_sft:
-            sft_loss_total -= completion_logprobs.sum()
-            sft_tokens += completion_logprobs.numel()
+            if completion_logprobs.numel() > 0:
+                sft_losses_per_ex.append(-completion_logprobs.mean())
+            else:
+                sft_losses_per_ex.append(torch.tensor(0.0, device=token_lp.device))
 
-    sft_loss = (sft_loss_total / sft_tokens) if (compute_sft and sft_tokens > 0) else None
+    # Stack SFT losses for individual weighting outside the function
+    sft_loss_tensor = torch.stack(sft_losses_per_ex) if compute_sft else None
 
     if no_grad:
         results_lp = [lp.detach() for lp in results_lp]
 
-    return results_lp, sft_loss
+    return results_lp, sft_loss_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +695,13 @@ def run_training_phase(
     accelerator.unwrap_model(model).gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
+
+
+    # Local accumulators for logging when sync_gradients activates
+    accumulated_loss_dpo = 0.0
+    accumulated_loss_sft = 0.0
+    accumulated_rw = 0.0
+    accumulated_steps = 0
 
     for sb_idx, sub_batch in enumerate(sub_batches):
         accelerator.print(f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {len(sub_batch)} examples")
@@ -722,7 +736,7 @@ def run_training_phase(
         unwrapped_model.set_adapter("policy")  # Switch back to Policy
 
         with accelerator.accumulate(model):
-            pol_lp_chosen, loss_sft = compute_logprobs_and_sft(
+            pol_lp_chosen, sft_losses_per_ex = compute_logprobs_and_sft(
                 model, processor, dpo_prompts, chosen_completions, images_list, cfg.max_seq_len, compute_sft=True,
                 no_grad=False
             )
@@ -738,10 +752,21 @@ def run_training_phase(
                 reward_weights=reward_weights,
             )
 
+            # <--- Weight SFT loss per example based on reward_weights
+            rw_tensor = torch.tensor(reward_weights, device=sft_losses_per_ex.device, dtype=sft_losses_per_ex.dtype)
+            loss_sft = (sft_losses_per_ex * rw_tensor).mean()
+
             loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
+
 
             # Accelerate natively handles scaling loss by accumulation steps
             accelerator.backward(loss)
+
+            # Accumulate metrics locally for WandB Logging
+            accumulated_loss_dpo += loss_dpo.item()
+            accumulated_loss_sft += loss_sft.item()
+            accumulated_rw += sum(reward_weights) / len(reward_weights)
+            accumulated_steps += 1
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
@@ -753,7 +778,32 @@ def run_training_phase(
         # Only log properly when gradients actually stepped
         if accelerator.sync_gradients:
             global_step += 1
-            accelerator.print(f"  Step {global_step:4d} | loss={loss.item():.4f}")
+
+            # Compute averages over the accumulated steps
+            avg_dpo = accumulated_loss_dpo / accumulated_steps
+            avg_sft = accumulated_loss_sft / accumulated_steps
+            avg_rw = accumulated_rw / accumulated_steps
+
+            # <--- WandB Logging
+            accelerator.log({
+                "train/loss_total": loss.item(),
+                "train/loss_dpo": avg_dpo,
+                "train/loss_sft": avg_sft,
+                "train/reward_weight": avg_rw,
+                "train/learning_rate": scheduler.get_last_lr()[0],
+                "train/global_step": global_step,
+            }, step=global_step)
+
+            accelerator.print(
+                f"  Step {global_step:4d} | loss={loss.item():.4f} "
+                f"| dpo={avg_dpo:.4f} | sft={avg_sft:.4f} | rw={avg_rw:.4f}"
+            )
+
+            # Reset metrics accumulators
+            accumulated_loss_dpo = 0.0
+            accumulated_loss_sft = 0.0
+            accumulated_rw = 0.0
+            accumulated_steps = 0
 
             # ── ONLINE SYNC: Copy Policy weights to Reference weights ──
             if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
@@ -901,7 +951,14 @@ def load_jsonl(path: str) -> list[dict]:
 # Main
 # ---------------------------------------------------------------------------
 def main(cfg: FrameworkConfig):
-    accelerator = Accelerator()
+    accelerator = Accelerator(log_with="wandb")
+
+    # Initialize trackers if on main process
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name=cfg.wandb_project,
+            config=dataclasses.asdict(cfg)  # Easily log all parameters
+        )
 
     accelerator.print("[Init] Loading model and processor...")
     model, processor = load_models_and_processor(cfg, accelerator)
@@ -914,6 +971,10 @@ def main(cfg: FrameworkConfig):
     accelerator.print(f"[Data] {len(raw_data)} raw examples loaded.")
 
     train_online(model, processor, raw_data, guardrail, cfg, accelerator)
+
+    # <--- End Tracking nicely
+    if accelerator.is_main_process:
+        accelerator.end_training()
     accelerator.print("\n[Done] Training complete.")
 
 
@@ -928,6 +989,7 @@ if __name__ == "__main__":
         batch_size=8,  # train 2 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
+        wandb_project="gemma-online-dpo-sft"
     )
     main(cfg)
 

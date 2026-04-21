@@ -401,7 +401,7 @@ def judge_answers_batch(
     return results
 
 def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
-    vals = [scores.get(k, 3) for k in cfg.judge_criteria]
+    vals = [scores.get(k, 1) for k in cfg.judge_criteria]
     return (sum(vals) / len(vals) - 1) / 4.0
 
 
