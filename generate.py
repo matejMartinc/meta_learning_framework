@@ -5,9 +5,9 @@ from peft import PeftModel
 
 # 1. Configuration
 base_model_id = "google/gemma-3-12b-it"  # Adjust if using 2b or 27b
-adapter_path = "checkpoints_meta_learning/epoch_1_100k_examples"
+adapter_path = "checkpoints_sft"
 input_file = "data/gams_ft_dataset_1k_sample.jsonl"
-output_file = "gemma-3-12b-it_meta_epoch_1_100k_examples.jsonl"
+output_file = "gemma-3-12b-it_sft_100k_steps_predictions.jsonl"
 #output_file = "gemma-3-12b-it_base.jsonl"
 
 # 2. Load Tokenizer and Model

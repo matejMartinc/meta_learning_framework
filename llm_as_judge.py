@@ -5,7 +5,7 @@ import google.generativeai as genai
 from typing import List, Dict
 
 # --- Configuration ---
-GOOGLE_API_KEY = "key"
+GOOGLE_API_KEY = "API key"
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # List of your model result files (JSONL format)
