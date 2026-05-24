@@ -1,9 +1,26 @@
 Bootstrap: docker
-From: pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
+From: pytorch/pytorch:2.12.0-cuda13.2-cudnn9-devel
 
 %post
-    pip install wandb transformers peft evaluate datasets tokenizers numpy pandas nltk sentencepiece sentence_transformers torchvision ninja huggingface-hub deepspeed ujson Pillow accelerate langdetect flash-attn
+    # 1. Permanently disable the Ubuntu PEP 668 pip block
+    rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
 
+    # 2. Upgrade pip and core build tools
+    python3 -m pip install --upgrade pip setuptools wheel
+
+    # 3. CRITICAL FIX: Force Numpy 1.x to prevent the C-extension crash
+    python3 -m pip install "numpy<2.0.0"
+
+    # 4. Install all standard Python packages normally
+    # (Notice I removed 'numpy' from this list so it doesn't overwrite the one above)
+    python3 -m pip install \
+        wandb transformers peft evaluate datasets tokenizers \
+        pandas nltk sentencepiece sentence_transformers \
+        torchvision ninja huggingface-hub deepspeed ujson Pillow \
+        accelerate langdetect openai
+
+    # 5. Install flash-attn and vLLM WITHOUT build isolation
+    python3 -m pip install --no-build-isolation flash-attn vllm
 
 %environment
     export PATH=/usr/local/bin:$PATH
@@ -14,3 +31,5 @@ From: pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
 %runscript
     echo "Use this container to run torch."
     wandb login
+
+

@@ -21,9 +21,18 @@ from torch.optim import AdamW
 from langdetect import detect
 from peft import LoraConfig, get_peft_model
 
+import base64
+from io import BytesIO
+import concurrent.futures
+from openai import OpenAI
+
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-
+vllm_client = OpenAI(
+    api_key="EMPTY",
+    base_url=os.environ.get("VLLM_API_URL", "http://localhost:8000/v1")
+)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -172,9 +181,83 @@ def release_vram(accelerator: Accelerator, label: str = "") -> None:
     # accelerator.print(f"[VRAM] [{label}] Cache cleared.") # Un-comment to trace memory
 
 
+
+
+def encode_image_base64(img) -> str:
+    buffered = BytesIO()
+    # Convert RGBA to RGB if necessary
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    img.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 # ---------------------------------------------------------------------------
-# Batched generation
+# Batched generation hf generate
 # ---------------------------------------------------------------------------
+# def generate_answers_batch(
+#         model,
+#         processor,
+#         questions: list[dict],
+#         cfg: FrameworkConfig,
+#         accelerator: Accelerator,
+# ) -> list[str]:
+#     prompt_sys = "Always respond in a grammatically correct manner using correct noun-adjective gender/number agreement, even if the question contains typos or other grammatically incorrect words.\nCRITICAL: Always respond in the SAME LANGUAGE as the user's question.\nProvide your answer to the question below. \nQuestion:\n"
+#
+#     batch_messages = []
+#     for q in questions:
+#         clean_text = q["text"].replace("<image>\n", "").replace("<image>", "")
+#         if q["image"] is not None:
+#             msg = [
+#                 {"role": "user",
+#                  "content": [{"type": "image", "image": q["image"]}, {"type": "text", "text": prompt_sys + clean_text}]}
+#             ]
+#         else:
+#             msg = [
+#                 {"role": "user",
+#                  "content": [{"type": "text", "text": prompt_sys + clean_text}]}
+#             ]
+#         batch_messages.append(msg)
+#
+#     # Set padding side to left for generation
+#     processor.tokenizer.padding_side = "left"
+#
+#     # Process the batch
+#     inputs = processor.apply_chat_template(
+#         batch_messages,
+#         add_generation_prompt=True,
+#         tokenize=True,
+#         padding=True,  # Required for batches
+#         return_dict=True,
+#         truncation=True,
+#         max_length=512,
+#         return_tensors="pt"
+#     ).to(accelerator.device)
+#
+#     input_len = inputs["input_ids"].shape[1]
+#
+#     with torch.no_grad(), torch.inference_mode():
+#         output_ids = accelerator.unwrap_model(model).generate(
+#             **inputs,
+#             max_new_tokens=cfg.max_new_tokens,
+#             do_sample=False,
+#             use_cache=True,
+#             pad_token_id=processor.tokenizer.pad_token_id,
+#         )
+#
+#     del inputs
+#     release_vram(accelerator, "post-generation inputs")
+#
+#     results = []
+#     for i in range(len(questions)):
+#         new_ids = output_ids[i, input_len:]
+#         text = processor.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+#         results.append(text)
+#
+#     del output_ids
+#     release_vram(accelerator, "post-generation outputs")
+#     return results
+# ----------------------------------------------------------------------
+# Batched generation VLLM
+# ----------------------------------------------------------------------
 def generate_answers_batch(
         model,
         processor,
@@ -182,69 +265,187 @@ def generate_answers_batch(
         cfg: FrameworkConfig,
         accelerator: Accelerator,
 ) -> list[str]:
-    prompt_sys = "Always respond in a grammatically correct manner using correct noun-adjective gender/number agreement, even if the question contains typos or other grammatically incorrect words.\nCRITICAL: Always respond in the SAME LANGUAGE as the user's question.\nProvide your answer to the question below. \nQuestion:\n"
+    # -----------------------------------------------------------------------
+    # 1. INSTANT LORA SYNC (Save to RAM Disk)
+    # -----------------------------------------------------------------------
+    lora_path = "/dev/shm/policy_lora"
 
-    batch_messages = []
-    for q in questions:
+    # Only the main process needs to save the adapter
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        # Ensure we are saving the actively training policy adapter
+        unwrapped_model.save_pretrained(lora_path, selected_adapters=["policy"])
+
+    # Force all GPUs to wait until the main process finishes writing to RAM disk
+    accelerator.wait_for_everyone()
+
+    # -----------------------------------------------------------------------
+    # 2. BATCHED VLLM GENERATION
+    # -----------------------------------------------------------------------
+    prompt_sys = "Provide your answer to the question below. CRITICAL: Always respond in the SAME LANGUAGE as the user's question. \nQuestion:\n"
+
+    def fetch_vllm(q: dict) -> str:
         clean_text = q["text"].replace("<image>\n", "").replace("<image>", "")
+
+        # Build standard OpenAI-compatible message array
+        content = [{"type": "text", "text": prompt_sys + clean_text}]
         if q["image"] is not None:
-            msg = [
-                {"role": "user",
-                 "content": [{"type": "image", "image": q["image"]}, {"type": "text", "text": prompt_sys + clean_text}]}
-            ]
-        else:
-            msg = [
-                {"role": "user",
-                 "content": [{"type": "text", "text": prompt_sys + clean_text}]}
-            ]
-        batch_messages.append(msg)
+            base64_image = encode_image_base64(q["image"])
+            content.insert(0, {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+            })
 
-    # Set padding side to left for generation
-    processor.tokenizer.padding_side = "left"
-
-    # Process the batch
-    inputs = processor.apply_chat_template(
-        batch_messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        padding=True,  # Required for batches
-        return_dict=True,
-        truncation=True,
-        max_length=512,
-        return_tensors="pt"
-    ).to(accelerator.device)
-
-    input_len = inputs["input_ids"].shape[1]
-
-    with torch.no_grad(), torch.inference_mode():
-        output_ids = accelerator.unwrap_model(model).generate(
-            **inputs,
-            max_new_tokens=cfg.max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=processor.tokenizer.pad_token_id,
+        # By passing the absolute path to the model parameter,
+        # vLLM automatically hot-loads the updated LoRA weights for this specific request!
+        response = vllm_client.chat.completions.create(
+            model=lora_path,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=cfg.max_new_tokens,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
         )
+        return response.choices[0].message.content.strip()
 
-    del inputs
-    release_vram(accelerator, "post-generation inputs")
+    accelerator.print(f"[vLLM] Sending {len(questions)} requests to vLLM server...")
 
-    results = []
-    for i in range(len(questions)):
-        new_ids = output_ids[i, input_len:]
-        text = processor.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-        results.append(text)
+    # Blast requests concurrently. vLLM will batch them automatically on its end.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(questions)) as executor:
+        results = list(executor.map(fetch_vllm, questions))
 
-    del output_ids
-    release_vram(accelerator, "post-generation outputs")
     return results
 
 
 # ---------------------------------------------------------------------------
-# Batched judging
+# Batched judging hf generate
 # ---------------------------------------------------------------------------
+# def judge_answers_batch(
+#         model,
+#         processor,
+#         questions: list[dict],
+#         generated_answers: list[str],
+#         gold_answers: list[str],
+#         filtered_idx: list[int],
+#         cfg: FrameworkConfig,
+#         judge_system_prompt: str,
+#         accelerator: Accelerator,
+# ) -> list[tuple[dict, dict]]:
+#     num_examples = len(questions)
+#     results = [None] * num_examples
+#     filtered_set = set(filtered_idx)
+#
+#     # 1. Immediately handle auto-scored examples
+#     for idx in filtered_idx:
+#         results[idx] = (
+#             {k: 1 for k in cfg.judge_criteria},
+#             {k: 5 for k in cfg.judge_criteria}
+#         )
+#
+#     # 2. Identify indices that actually need the LLM
+#     indices_to_judge = [i for i in range(num_examples) if i not in filtered_set]
+#
+#     if not indices_to_judge:
+#         return results
+#
+#     # 3. Process only the required indices in chunks
+#     for start_ptr in range(0, len(indices_to_judge), cfg.max_judge_batch_size):
+#         end_ptr = min(start_ptr + cfg.max_judge_batch_size, len(indices_to_judge))
+#         current_batch_indices = indices_to_judge[start_ptr:end_ptr]
+#
+#         chunk_questions = [questions[i] for i in current_batch_indices]
+#         chunk_gen = [generated_answers[i] for i in current_batch_indices]
+#         chunk_gold = [gold_answers[i] for i in current_batch_indices]
+#
+#         chunk_orderings = []
+#         for gen, gold in zip(chunk_gen, chunk_gold):
+#             if random.randint(0, 1) == 0:
+#                 chunk_orderings.append((gen, gold, "ANSWER 1", "ANSWER 2"))
+#             else:
+#                 chunk_orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
+#
+#         batch_messages = []
+#         for q_dict, (a1, a2, _, _) in zip(chunk_questions, chunk_orderings):
+#             clean_text = q_dict["text"].replace("<image>\n", "").replace("<image>", "")
+#             user_content = f"QUESTION:\n{clean_text}\n\nANSWER 1:\n{a1}\n\nANSWER 2:\n{a2}"
+#             if q_dict["image"] is not None:
+#                 msg = [
+#                     {"role": "user",
+#                      "content": [{"type": "image", "image": q_dict["image"]},
+#                                  {"type": "text", "text": judge_system_prompt + user_content}]}
+#                 ]
+#             else:
+#                 msg = [
+#                     {"role": "user",
+#                      "content": [{"type": "text", "text": judge_system_prompt + user_content}]}
+#                 ]
+#             batch_messages.append(msg)
+#             #accelerator.print("---------------------Generated text:\n----------------------")
+#             #accelerator.print(judge_system_prompt + user_content)
+#             #accelerator.print("------------------------------------------------------------")
+#
+#         # Set padding side to left for generation
+#         processor.tokenizer.padding_side = "left"
+#
+#         # Process the batch
+#         inputs = processor.apply_chat_template(
+#             batch_messages,
+#             add_generation_prompt=True,
+#             tokenize=True,
+#             padding=True,  # Required for batches
+#             truncation=True,
+#             max_length=cfg.max_seq_len,
+#             return_dict=True,
+#             return_tensors="pt"
+#         ).to(accelerator.device)
+#
+#         input_length = inputs["input_ids"].shape[1]
+#
+#         with torch.inference_mode():
+#             output_ids = accelerator.unwrap_model(model).generate(
+#                 **inputs,
+#                 max_new_tokens=128,
+#                 do_sample=False,
+#                 use_cache=True,
+#                 pad_token_id=processor.tokenizer.pad_token_id,
+#             )
+#
+#         generated_tokens = output_ids[:, input_length:]
+#         del inputs
+#         release_vram(accelerator, "post-judge inputs chunk")
+#
+#         for i, global_idx in enumerate(current_batch_indices):
+#             _, _, generated_key, gs_key = chunk_orderings[i]
+#             raw = processor.tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
+#
+#             try:
+#                 #accelerator.print('----------------------------JUDGE------------------------------')
+#                 #accelerator.print(raw)
+#                 #accelerator.print('----------------------------JUDGE------------------------------')
+#                 cleaned = raw.replace("```json", "").replace("```", "").strip()
+#                 scores = json.loads(cleaned)
+#                 scores_generated = scores[generated_key]
+#                 scores_gs = scores[gs_key]
+#
+#                 for k in cfg.judge_criteria:
+#                     scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
+#                     scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
+#
+#                 results[global_idx] = (scores_generated, scores_gs)
+#             except Exception as e:
+#                 accelerator.print(f"[Judge ] Parse failed for idx {global_idx} — using fallback. Error:", e)
+#                 results[global_idx] = (
+#                     {k: 1 for k in cfg.judge_criteria},
+#                     {k: 5 for k in cfg.judge_criteria}
+#                 )
+#
+#         del output_ids
+#         release_vram(accelerator, "post-judge chunk complete")
+#
+#     return results
+
 def judge_answers_batch(
-        model,
-        processor,
+        model,  # Kept for API compatibility with run_inference_phase
+        processor,  # Kept for API compatibility
         questions: list[dict],
         generated_answers: list[str],
         gold_answers: list[str],
@@ -257,7 +458,7 @@ def judge_answers_batch(
     results = [None] * num_examples
     filtered_set = set(filtered_idx)
 
-    # 1. Immediately handle auto-scored examples
+    # 1. Immediately handle auto-scored (discarded) examples
     for idx in filtered_idx:
         results[idx] = (
             {k: 1 for k in cfg.judge_criteria},
@@ -270,99 +471,78 @@ def judge_answers_batch(
     if not indices_to_judge:
         return results
 
-    # 3. Process only the required indices in chunks
-    for start_ptr in range(0, len(indices_to_judge), cfg.max_judge_batch_size):
-        end_ptr = min(start_ptr + cfg.max_judge_batch_size, len(indices_to_judge))
-        current_batch_indices = indices_to_judge[start_ptr:end_ptr]
+    # Path to where generate_answers_batch previously saved the LoRA weights
+    lora_path = "/dev/shm/policy_lora"
 
-        chunk_questions = [questions[i] for i in current_batch_indices]
-        chunk_gen = [generated_answers[i] for i in current_batch_indices]
-        chunk_gold = [gold_answers[i] for i in current_batch_indices]
+    # 3. Define the worker function for a single judgment
+    def fetch_and_parse(idx: int):
+        q_dict = questions[idx]
+        gen_ans = generated_answers[idx]
+        gold_ans = gold_answers[idx]
 
-        chunk_orderings = []
-        for gen, gold in zip(chunk_gen, chunk_gold):
-            if random.randint(0, 1) == 0:
-                chunk_orderings.append((gen, gold, "ANSWER 1", "ANSWER 2"))
-            else:
-                chunk_orderings.append((gold, gen, "ANSWER 2", "ANSWER 1"))
+        # Randomize order to prevent LLM position bias
+        if random.randint(0, 1) == 0:
+            a1, a2, gen_key, gs_key = gen_ans, gold_ans, "ANSWER 1", "ANSWER 2"
+        else:
+            a2, a1, gen_key, gs_key = gen_ans, gold_ans, "ANSWER 2", "ANSWER 1"
 
-        batch_messages = []
-        for q_dict, (a1, a2, _, _) in zip(chunk_questions, chunk_orderings):
-            clean_text = q_dict["text"].replace("<image>\n", "").replace("<image>", "")
-            user_content = f"QUESTION:\n{clean_text}\n\nANSWER 1:\n{a1}\n\nANSWER 2:\n{a2}"
-            if q_dict["image"] is not None:
-                msg = [
-                    {"role": "user",
-                     "content": [{"type": "image", "image": q_dict["image"]},
-                                 {"type": "text", "text": judge_system_prompt + user_content}]}
-                ]
-            else:
-                msg = [
-                    {"role": "user",
-                     "content": [{"type": "text", "text": judge_system_prompt + user_content}]}
-                ]
-            batch_messages.append(msg)
-            #accelerator.print("---------------------Generated text:\n----------------------")
-            #accelerator.print(judge_system_prompt + user_content)
-            #accelerator.print("------------------------------------------------------------")
+        clean_text = q_dict["text"].replace("<image>\n", "").replace("<image>", "")
+        user_content = f"QUESTION:\n{clean_text}\n\nANSWER 1:\n{a1}\n\nANSWER 2:\n{a2}"
 
-        # Set padding side to left for generation
-        processor.tokenizer.padding_side = "left"
+        # Construct OpenAI API-style messages
+        content = [{"type": "text", "text": judge_system_prompt + user_content}]
+        if q_dict["image"] is not None:
+            base64_image = encode_image_base64(q_dict["image"])
+            content.insert(0, {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+            })
 
-        # Process the batch
-        inputs = processor.apply_chat_template(
-            batch_messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            padding=True,  # Required for batches
-            truncation=True,
-            max_length=cfg.max_seq_len,
-            return_dict=True,
-            return_tensors="pt"
-        ).to(accelerator.device)
-
-        input_length = inputs["input_ids"].shape[1]
-
-        with torch.inference_mode():
-            output_ids = accelerator.unwrap_model(model).generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=processor.tokenizer.pad_token_id,
+        # Step A: Call vLLM API
+        try:
+            response = vllm_client.chat.completions.create(
+                model=lora_path,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=128,
+                temperature=0.0,  # Temperature 0 is strictly better for Judge determinism
             )
+            raw = response.choices[0].message.content.strip()
+        except Exception as e:
+            return idx, False, str(e), None
 
-        generated_tokens = output_ids[:, input_length:]
-        del inputs
-        release_vram(accelerator, "post-judge inputs chunk")
+        # Step B: Parse JSON Output
+        try:
+            cleaned = raw.replace("```json", "").replace("```", "").strip()
+            scores = json.loads(cleaned)
+            scores_generated = scores[gen_key]
+            scores_gs = scores[gs_key]
 
-        for i, global_idx in enumerate(current_batch_indices):
-            _, _, generated_key, gs_key = chunk_orderings[i]
-            raw = processor.tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip()
+            for k in cfg.judge_criteria:
+                scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
+                scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
 
-            try:
-                #accelerator.print('----------------------------JUDGE------------------------------')
-                #accelerator.print(raw)
-                #accelerator.print('----------------------------JUDGE------------------------------')
-                cleaned = raw.replace("```json", "").replace("```", "").strip()
-                scores = json.loads(cleaned)
-                scores_generated = scores[generated_key]
-                scores_gs = scores[gs_key]
+            return idx, True, scores_generated, scores_gs
 
-                for k in cfg.judge_criteria:
-                    scores_generated[k] = int(max(1, min(5, scores_generated.get(k, 1))))
-                    scores_gs[k] = int(max(1, min(5, scores_gs.get(k, 5))))
+        except Exception as e:
+            return idx, False, f"Parse Error: {e} | Raw string: {raw}", None
 
-                results[global_idx] = (scores_generated, scores_gs)
-            except Exception as e:
-                accelerator.print(f"[Judge ] Parse failed for idx {global_idx} — using fallback. Error:", e)
-                results[global_idx] = (
-                    {k: 1 for k in cfg.judge_criteria},
-                    {k: 5 for k in cfg.judge_criteria}
-                )
+    accelerator.print(f"[Judge] Sending {len(indices_to_judge)} requests to vLLM server...")
 
-        del output_ids
-        release_vram(accelerator, "post-judge chunk complete")
+    # 4. Blast all required requests concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(indices_to_judge)) as executor:
+        futures_results = list(executor.map(fetch_and_parse, indices_to_judge))
+
+    # 5. Unpack results and handle any failures using your original fallback logic
+    for res in futures_results:
+        idx, success, data1, data2 = res
+        if success:
+            results[idx] = (data1, data2)
+        else:
+            accelerator.print(f"[Judge] Failed for idx {idx} — using fallback. Error: {data1}")
+            results[idx] = (
+                {k: 1 for k in cfg.judge_criteria},
+                {k: 5 for k in cfg.judge_criteria}
+            )
 
     return results
 
