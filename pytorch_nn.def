@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: pytorch/pytorch:2.12.0-cuda13.2-cudnn9-devel
+From: pytorch/pytorch:2.12.0-cuda12.6-cudnn9-devel
 
 %post
     # 1. Permanently disable the Ubuntu PEP 668 pip block
@@ -8,19 +8,23 @@ From: pytorch/pytorch:2.12.0-cuda13.2-cudnn9-devel
     # 2. Upgrade pip and core build tools
     python3 -m pip install --upgrade pip setuptools wheel
 
-    # 3. CRITICAL FIX: Force Numpy 1.x to prevent the C-extension crash
+    # 3. Force Numpy 1.x to prevent the C-extension crash
     python3 -m pip install "numpy<2.0.0"
 
     # 4. Install all standard Python packages normally
-    # (Notice I removed 'numpy' from this list so it doesn't overwrite the one above)
     python3 -m pip install \
         wandb transformers peft evaluate datasets tokenizers \
         pandas nltk sentencepiece sentence_transformers \
         torchvision ninja huggingface-hub deepspeed ujson Pillow \
         accelerate langdetect openai
 
-    # 5. Install flash-attn and vLLM WITHOUT build isolation
-    python3 -m pip install --no-build-isolation flash-attn vllm
+    # 5. FORCE PRE-COMPILED FLASH-ATTN & BYPASS TORCH 2.4 METADATA CHECK
+    # --no-deps ensures your PyTorch 2.11.0 version is preserved and ignored by the validator
+    export VLLM_FLASH_ATTN_CUDA_VERSION=12.4
+    python3 -m pip install vllm-flash-attn --no-build-isolation --no-deps
+
+    # 6. Install vllm normally
+    python3 -m pip install vllm --no-build-isolation --no-deps
 
 %environment
     export PATH=/usr/local/bin:$PATH
