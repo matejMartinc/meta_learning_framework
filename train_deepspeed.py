@@ -299,11 +299,18 @@ def generate_answers_batch(
         # By passing the absolute path to the model parameter,
         # vLLM automatically hot-loads the updated LoRA weights for this specific request!
         response = vllm_client.chat.completions.create(
-            model=lora_path,
+            model="google/gemma-3-12b-it",  # <-- always the base model name
             messages=[{"role": "user", "content": content}],
             max_tokens=cfg.max_new_tokens,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
+            extra_body={
+                "lora_request": {
+                    "lora_name": "policy",
+                    "lora_int_id": 1,
+                    "lora_local_path": "/dev/shm/policy_lora"
+                }
+            }
         )
         return response.choices[0].message.content.strip()
 
@@ -501,11 +508,21 @@ def judge_answers_batch(
         # Step A: Call vLLM API
         try:
             response = vllm_client.chat.completions.create(
-                model=lora_path,
+                model="google/gemma-3-12b-it",  # <-- always the base model name
                 messages=[{"role": "user", "content": content}],
                 max_tokens=128,
-                temperature=0.0,  # Temperature 0 is strictly better for Judge determinism
+                temperature=0.0,
+                extra_body={
+                    "lora_request": {
+                        "lora_name": "policy",
+                        "lora_int_id": 1,
+                        "lora_local_path": "/dev/shm/policy_lora"
+                    }
+                }
             )
+
+
+
             raw = response.choices[0].message.content.strip()
         except Exception as e:
             return idx, False, str(e), None
@@ -1166,9 +1183,9 @@ if __name__ == "__main__":
         #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
         data_path = "data/train_gams_nemotron.jsonl",
         num_epochs=1,
-        inference_batch_size=128,  # generate batch
-        max_judge_batch_size=32,  # judge batch at a time
-        batch_size=8,  # train 2 at a time (per-GPU)
+        inference_batch_size=48,  # generate batch
+        max_judge_batch_size=24,  # judge batch at a time
+        batch_size=6,  # train 4 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=100,
         wandb_project="gemma-online-dpo-sft"

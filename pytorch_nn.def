@@ -1,35 +1,61 @@
 Bootstrap: docker
-From: pytorch/pytorch:2.12.0-cuda13.2-cudnn9-devel
+From: pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
 
 %post
-    # 1. Permanently disable the Ubuntu PEP 668 pip block
+    export PATH=/usr/local/bin:$PATH
+    export https_proxy=http://www-proxy.ijs.si:8080
+    export http_proxy=http://www-proxy.ijs.si:8080
+    export no_proxy=127.0.0.0/8
     rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
-
-    # 2. Upgrade pip and core build tools
     python3 -m pip install --upgrade pip setuptools wheel
+    python3 -m pip install "numpy==2.2.6"
 
-    # 3. CRITICAL FIX: Force Numpy 1.x to prevent the C-extension crash
-    python3 -m pip install "numpy<2.0.0"
+    # 1. Install vllm first so its own deps resolve cleanly
+    python3 -m pip install "vllm==0.19.0"
 
-    # 4. Install all standard Python packages normally
-    # (Notice I removed 'numpy' from this list so it doesn't overwrite the one above)
+    # 2. Pin transformers to a version vllm 0.9.0 is compatible with
+    #    (4.52.0 added aimv2 natively, causing the conflict)
+    python3 -m pip install "transformers==4.57.6"
+
+    # 3. flash-attn: use pre-built wheel to avoid OOM during nvcc compilation
+    #    Find the right wheel at https://github.com/Dao-AILab/flash-attention/releases
+    pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+
+
+    # 4. Rest of the training stack
     python3 -m pip install \
-        wandb transformers peft evaluate datasets tokenizers \
-        pandas nltk sentencepiece sentence_transformers \
-        torchvision ninja huggingface-hub deepspeed ujson Pillow \
-        accelerate langdetect openai
-
-    # 5. Install flash-attn and vLLM WITHOUT build isolation
-    python3 -m pip install --no-build-isolation flash-attn vllm
+        wandb \
+        peft \
+        evaluate \
+        datasets \
+        tokenizers \
+        pandas \
+        nltk \
+        sentencepiece \
+        sentence_transformers \
+        ninja \
+        huggingface-hub \
+        deepspeed \
+        ujson \
+        Pillow \
+        accelerate \
+        langdetect \
+        openai
 
 %environment
     export PATH=/usr/local/bin:$PATH
+    export https_proxy=http://www-proxy.ijs.si:8080
+    export http_proxy=http://www-proxy.ijs.si:8080
+    export no_proxy=127.0.0.0/8
+    export PATH=/usr/local/bin:$PATH
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
     export WANDB_API_KEY=0371b79d28c3adb07413603f8d52a735ca4568f3
     export WANDB_ENTITY=matejm
     export WANDB_PROJECT=gemma-online-training
 
 %runscript
-    echo "Use this container to run torch."
+    echo "Container ready."
     wandb login
+
 
 

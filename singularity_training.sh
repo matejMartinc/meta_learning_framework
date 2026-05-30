@@ -4,48 +4,57 @@
 #SBATCH --error=job_outputs/train.err
 #SBATCH --time=14-00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks=1                  # Number of tasks (1 per job)
-#SBATCH --gpus=4                   # Number of GPUs per node
+#SBATCH --ntasks=1
+#SBATCH --gpus=4
 #SBATCH --cpus-per-task=16
 #SBATCH --partition=e8
-#sbatch --nodelist=elixir,kt-gpu4
+#SBATCH --nodelist=elixir,kt-gpu4
 
 export PATH=/usr/local/bin:$PATH
 export https_proxy=http://www-proxy.ijs.si:8080
 export http_proxy=http://www-proxy.ijs.si:8080
-
-# CRITICAL FIX: Added localhost and 127.0.0.1 to no_proxy so vLLM API calls stay local
-export no_proxy=127.0.0.0/8,localhost,127.0.0.1
+export no_proxy=127.0.0.0/8,localhost,127.0.0.1,::1
+export NO_PROXY=127.0.0.0/8,localhost,127.0.0.1,::1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 1. Start vLLM in the background on GPU 0 using your Singularity container
-# Using a random port helps prevent conflicts if other jobs run on the same node
 PORT=$((8000 + RANDOM % 1000))
-echo "Starting vLLM on port $PORT..."
+echo "Starting vLLM on GPU 0, port $PORT..."
 
-# Upgrade vLLM and Transformers into your local user directory
-srun singularity exec --nv out/pytorch_nn.sif python -m pip install --user --upgrade vllm transformers
-
-CUDA_VISIBLE_DEVICES=0 singularity exec --nv out/pytorch_nn.sif vllm serve google/gemma-3-12b-it \
+# Run vLLM directly (no srun) — stays alive as a background process on this node
+CUDA_VISIBLE_DEVICES=0 singularity exec --nv \
+    --env CUDA_VISIBLE_DEVICES=0 \
+    --env http_proxy="" \
+    --env https_proxy="" \
+    --env HTTP_PROXY="" \
+    --env HTTPS_PROXY="" \
+    --bind /etc/passwd,/etc/group,/dev/shm:/dev/shm out/pytorch_nn.sif \
+    vllm serve google/gemma-3-12b-it \
     --enable-lora \
     --max-lora-rank 16 \
     --port $PORT &
 VLLM_PID=$!
 
-# 2. Wait for vLLM server to be fully ready
 echo "Waiting for vLLM to initialize..."
 while ! curl -s http://localhost:$PORT/v1/models > /dev/null; do
     sleep 10
 done
 echo "vLLM is ready!"
 
-# 3. Export the vLLM URL so your Python script can use it
 export VLLM_API_URL="http://localhost:$PORT/v1"
+echo "Starting DeepSpeed training on GPUs 1,2,3..."
 
-# 4. Run the Accelerate training script on the remaining GPUs (GPUs 1, 2, and 3)
-echo "Starting DeepSpeed training..."
-CUDA_VISIBLE_DEVICES=1,2,3 srun singularity exec --nv out/pytorch_nn.sif \
+srun --overlap --ntasks=1 --gpus=3 \
+    singularity exec --nv \
+    --env CUDA_VISIBLE_DEVICES=1,2,3 \
+    --env http_proxy=http://www-proxy.ijs.si:8080 \
+    --env https_proxy=http://www-proxy.ijs.si:8080 \
+    --env HTTP_PROXY=http://www-proxy.ijs.si:8080 \
+    --env HTTPS_PROXY=http://www-proxy.ijs.si:8080 \
+    --env no_proxy=127.0.0.0/8,localhost,127.0.0.1,::1 \
+    --env NO_PROXY=127.0.0.0/8,localhost,127.0.0.1,::1 \
+    --env VLLM_API_URL="http://localhost:$PORT/v1" \
+    --bind /etc/passwd,/etc/group,/dev/shm:/dev/shm out/pytorch_nn.sif \
     accelerate launch --config_file accelerate_config.yaml train_deepspeed.py
 
-# 5. Clean up vLLM when training finishes
 kill $VLLM_PID
+wait $VLLM_PID 2>/dev/null
