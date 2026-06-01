@@ -67,7 +67,7 @@ class FrameworkConfig:
     max_judge_batch_size: int = 8  # max batch size for judging
     batch_size: int = 4  # smaller sub-batch for SFT + DPO training
     grad_accumulation_steps: int = 1
-    warmup_steps: int = 50
+    warmup_steps: int = 200
     cosine_cycle_steps: int = 200
     sft_loss_weight: float = 0.4
     output_dir: str = "./checkpoints"
@@ -1052,11 +1052,15 @@ def train_online(
     raw_data = raw_data[:min_len]
 
     optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.01)
-    placeholder_total = max(1, cfg.cosine_cycle_steps * cfg.num_epochs)
+    items_per_gpu = len(raw_data) // accelerator.num_processes
+    max_steps_per_epoch = items_per_gpu // cfg.batch_size
+    total_expected_steps = max_steps_per_epoch * cfg.num_epochs
+    total_expected_steps = total_expected_steps // cfg.grad_accumulation_steps
+
     scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
         optimizer,
         num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=placeholder_total,
+        num_training_steps=max(1, total_expected_steps),
         num_cycles=cfg.num_epochs,
     )
 
