@@ -132,8 +132,10 @@ def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
     base_model = AutoModelForImageTextToText.from_pretrained(
         cfg.model_name,
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2"
+        attn_implementation="flash_attention_2",
+        device_map={"": accelerator.local_process_index}
     )
+    base_model.enable_input_require_grads()
 
     # 1. Define LoRA Config
     lora_config = LoraConfig(
@@ -808,93 +810,99 @@ def compute_logprobs_and_sft(
         model,
         processor,
         prompts: list[str],
-        completions: list[str],
+        chosen_completions: list[str],
+        rejected_completions: list[str],
         images_list: list[Optional[Any]],
         max_len: int,
         compute_sft: bool = False,
         no_grad: bool = False,
 ):
-    # Determine if there are ANY images in this training batch
+    """
+    Compute log-probs for chosen AND rejected in a single forward pass each,
+    but sequentially (not batched together) to keep peak memory flat.
+    Chosen and rejected share the same prompt, so we encode them separately
+    but avoid redundant prompt re-encoding.
+    """
+    batch_size = len(prompts)
     has_any_image = any(img is not None for img in images_list)
-
-    # Pad images so the length matches the text length exactly
     batch_imgs = [[img] if img is not None else [] for img in images_list]
 
-    # Right padding naturally isolates targets at the end
     original_pad_side = processor.tokenizer.padding_side
     processor.tokenizer.padding_side = "right"
 
-    enc_f_batch = processor(
-        text=[p + c for p, c in zip(prompts, completions)],
-        images=batch_imgs if has_any_image else None,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_len,
-        add_special_tokens=False
-    ).to(model.device)
-
-    # Find where completion starts inside the right-padded sequences
-    prompt_lengths = []
-    seq_lengths = []
-    for i, (p, img) in enumerate(zip(prompts, images_list)):
-        enc_p = processor(
-            text=p,
-            images=[img] if img is not None else None,
+    def _single_forward(completions):
+        enc = processor(
+            text=[p + c for p, c in zip(prompts, completions)],
+            images=batch_imgs if has_any_image else None,
             return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=max_len,
-            add_special_tokens=False
-        )
-        prompt_lengths.append(enc_p["input_ids"].shape[1])
-        seq_lengths.append(enc_f_batch["attention_mask"][i].sum().item())
+            add_special_tokens=False,
+        ).to(model.device)
+
+        # Compute prompt lengths once per completion set
+        p_lens, s_lens = [], []
+        for i, (p, img) in enumerate(zip(prompts, images_list)):
+            enc_p = processor(
+                text=p,
+                images=[img] if img is not None else None,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_len,
+                add_special_tokens=False,
+            )
+            p_lens.append(enc_p["input_ids"].shape[1])
+            s_lens.append(int(enc["attention_mask"][i].sum().item()))
+            # Free immediately — don't let these accumulate
+            del enc_p
+
+        ctx = torch.inference_mode() if no_grad else torch.enable_grad()
+        with ctx, torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            outputs = model(**enc)
+
+        # Shift once, then slice per-example to avoid holding full logits
+        # We process token-by-token in the vocab dimension only for the
+        # completion slice, so peak memory stays bounded.
+        shift_logits = outputs.logits[:, :-1].contiguous()
+        shift_labels = enc["input_ids"][:, 1:].contiguous()
+        del outputs, enc  # free ASAP before per-example loop
+
+        lp_list, sft_list = [], []
+        for i, p_len in enumerate(p_lens):
+            s_len = s_lens[i]
+            if s_len <= p_len:
+                lp_list.append(torch.tensor(0.0, device=shift_logits.device))
+                if compute_sft:
+                    sft_list.append(torch.tensor(0.0, device=shift_logits.device))
+                continue
+
+            # Only slice the completion window — avoids allocating float32
+            # cross-entropy over the full (padded) sequence length
+            ex_logits = shift_logits[i, p_len - 1 : s_len - 1]   # [T_comp, V]
+            ex_labels = shift_labels[i, p_len - 1 : s_len - 1]   # [T_comp]
+
+            ex_ce = F.cross_entropy(ex_logits, ex_labels, reduction="none")
+            lp_list.append((-ex_ce).sum())
+            if compute_sft:
+                sft_list.append(ex_ce.mean())
+
+            del ex_logits, ex_labels, ex_ce
+
+        del shift_logits, shift_labels
+
+        if no_grad:
+            lp_list = [lp.detach() for lp in lp_list]
+
+        sft_tensor = torch.stack(sft_list) if compute_sft else None
+        return lp_list, sft_tensor
+
+    # ── Run chosen, then rejected sequentially ────────────────────────────
+    lp_chosen, sft_tensor = _single_forward(chosen_completions)
+    lp_rejected, _ = _single_forward(rejected_completions)
 
     processor.tokenizer.padding_side = original_pad_side
-
-    ctx = torch.inference_mode() if no_grad else torch.enable_grad()
-    with ctx, torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        outputs = model(**enc_f_batch)
-
-    shift_logits = outputs.logits[:, :-1, :].contiguous()
-    shift_labels = enc_f_batch["input_ids"][:, 1:].contiguous()
-
-    # --- MEMORY FIX: Do not compute CrossEntropy on the full padded sequence ---
-    results_lp = []
-    sft_losses_per_ex = []
-
-    for i, p_len in enumerate(prompt_lengths):
-        s_len = seq_lengths[i]
-
-        # Edge case safeguard
-        if s_len <= p_len:
-            results_lp.append(torch.tensor(0.0, device=shift_logits.device))
-            if compute_sft:
-                sft_losses_per_ex.append(torch.tensor(0.0, device=shift_logits.device))
-            continue
-
-        # 1. Slice OUT the prompt tokens. We only care about the completion tokens!
-        # This prevents PyTorch from allocating float32 memory for the prompt logits.
-        ex_logits = shift_logits[i, p_len - 1: s_len - 1]
-        ex_labels = shift_labels[i, p_len - 1: s_len - 1]
-
-        # 2. Calculate CE loss only on the generated tokens
-        ex_ce_loss = torch.nn.functional.cross_entropy(ex_logits, ex_labels, reduction='none')
-        ex_logprobs = -ex_ce_loss
-
-        results_lp.append(ex_logprobs.sum())
-
-        if compute_sft:
-            sft_losses_per_ex.append(-ex_logprobs.mean())
-
-    # Free the massive full-sequence logits immediately to prevent buildup
-    del outputs, shift_logits, shift_labels
-
-    sft_loss_tensor = torch.stack(sft_losses_per_ex) if compute_sft else None
-
-    if no_grad:
-        results_lp = [lp.detach() for lp in results_lp]
-
-    return results_lp, sft_loss_tensor
+    return lp_chosen, lp_rejected, sft_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -911,7 +919,7 @@ def run_training_phase(
         accelerator: Accelerator,
 ) -> int:
     sub_batches = [
-        valid_examples[i: i + cfg.batch_size]
+        valid_examples[i : i + cfg.batch_size]
         for i in range(0, len(valid_examples), cfg.batch_size)
     ]
 
@@ -919,53 +927,50 @@ def run_training_phase(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-
-    # Local accumulators for logging when sync_gradients activates
     accumulated_loss_dpo = 0.0
     accumulated_loss_sft = 0.0
     accumulated_rw = 0.0
     accumulated_steps = 0
 
     for sb_idx, sub_batch in enumerate(sub_batches):
-        accelerator.print(f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {len(sub_batch)} examples")
+        accelerator.print(
+            f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {len(sub_batch)} examples"
+        )
 
-        dpo_prompts = [ex.dpo_prompt for ex in sub_batch]
-        chosen_completions = [ex.chosen_completion for ex in sub_batch]
-        rejected_completions = [ex.rejected_completion for ex in sub_batch]
-        reward_weights = [ex.reward_weight for ex in sub_batch]
-        images_list = [ex.question_image for ex in sub_batch]
+        dpo_prompts          = [ex.dpo_prompt           for ex in sub_batch]
+        chosen_completions   = [ex.chosen_completion     for ex in sub_batch]
+        rejected_completions = [ex.rejected_completion   for ex in sub_batch]
+        reward_weights       = [ex.reward_weight         for ex in sub_batch]
+        images_list          = [ex.question_image        for ex in sub_batch]
 
-        # ── Ref log-probs (no grad, ref model) ──────────────────────
-        # Ensure we are working with the raw model interface for PEFT adapter switching
         unwrapped_model = accelerator.unwrap_model(model)
 
-        # ── Ref log-probs (no grad, reference adapter) ──────────────────────
+        # ── 1. Reference log-probs — no grad ─────────────────────────────
         model.eval()
-        unwrapped_model.set_adapter("reference")  # Switch to Reference
+        unwrapped_model.set_adapter("reference")
 
         with torch.no_grad():
-            ref_lp_chosen, _ = compute_logprobs_and_sft(
-                model, processor, dpo_prompts, chosen_completions, images_list, cfg.max_seq_len, compute_sft=False,
-                no_grad=True
+            ref_lp_chosen, ref_lp_rejected, _ = compute_logprobs_and_sft(
+                model, processor,
+                dpo_prompts, chosen_completions, rejected_completions,
+                images_list, cfg.max_seq_len,
+                compute_sft=False, no_grad=True,
             )
-            ref_lp_rejected, _ = compute_logprobs_and_sft(
-                model, processor, dpo_prompts, rejected_completions, images_list, cfg.max_seq_len, compute_sft=False,
-                no_grad=True
-            )
+
         release_vram(accelerator, f"sub-batch {sb_idx + 1} ref logprobs")
 
-        # ── Policy log-probs + SFT (with grad, policy adapter) ───────
+        # ── 2. Policy log-probs + SFT — with grad ────────────────────────
         model.train()
-        unwrapped_model.set_adapter("policy")  # Switch back to Policy
+        unwrapped_model.set_adapter("policy")
 
         with accelerator.accumulate(model):
-            pol_lp_chosen, sft_losses_per_ex = compute_logprobs_and_sft(
-                model, processor, dpo_prompts, chosen_completions, images_list, cfg.max_seq_len, compute_sft=True,
-                no_grad=False
-            )
-            pol_lp_rejected, _ = compute_logprobs_and_sft(
-                model, processor, dpo_prompts, rejected_completions, images_list, cfg.max_seq_len, compute_sft=False,
-                no_grad=False
+            pol_lp_chosen, pol_lp_rejected, sft_losses_per_ex = (
+                compute_logprobs_and_sft(
+                    model, processor,
+                    dpo_prompts, chosen_completions, rejected_completions,
+                    images_list, cfg.max_seq_len,
+                    compute_sft=True, no_grad=False,
+                )
             )
 
             loss_dpo = dpo_loss_weighted_batch(
@@ -975,17 +980,16 @@ def run_training_phase(
                 reward_weights=reward_weights,
             )
 
-            # <--- Weight SFT loss per example based on reward_weights
-            rw_tensor = torch.tensor(reward_weights, device=sft_losses_per_ex.device, dtype=sft_losses_per_ex.dtype)
+            rw_tensor = torch.tensor(
+                reward_weights,
+                device=sft_losses_per_ex.device,
+                dtype=sft_losses_per_ex.dtype,
+            )
             loss_sft = (sft_losses_per_ex * rw_tensor).mean()
-
             loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
 
-
-            # Accelerate natively handles scaling loss by accumulation steps
             accelerator.backward(loss)
 
-            # Accumulate metrics locally for WandB Logging
             accumulated_loss_dpo += loss_dpo.item()
             accumulated_loss_sft += loss_sft.item()
             accumulated_rw += sum(reward_weights) / len(reward_weights)
@@ -995,26 +999,23 @@ def run_training_phase(
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
 
             optimizer.step()
-            #scheduler.step()
             optimizer.zero_grad()
 
-        # Only log properly when gradients actually stepped
         if accelerator.sync_gradients:
             global_step += 1
+            #scheduler.step()  # <-- move here, after optimizer.step()
 
-            # Compute averages over the accumulated steps
             avg_dpo = accumulated_loss_dpo / accumulated_steps
             avg_sft = accumulated_loss_sft / accumulated_steps
-            avg_rw = accumulated_rw / accumulated_steps
+            avg_rw  = accumulated_rw       / accumulated_steps
 
-            # <--- WandB Logging
             accelerator.log({
-                "train/loss_total": loss.item(),
-                "train/loss_dpo": avg_dpo,
-                "train/loss_sft": avg_sft,
+                "train/loss_total":    loss.item(),
+                "train/loss_dpo":      avg_dpo,
+                "train/loss_sft":      avg_sft,
                 "train/reward_weight": avg_rw,
-                "train/learning_rate": scheduler.get_last_lr()[0],
-                "train/global_step": global_step,
+                "train/learning_rate": optimizer.param_groups[0]["lr"],
+                "train/global_step":   global_step,
             }, step=global_step)
 
             accelerator.print(
@@ -1022,28 +1023,24 @@ def run_training_phase(
                 f"| dpo={avg_dpo:.4f} | sft={avg_sft:.4f} | rw={avg_rw:.4f}"
             )
 
-            # Reset metrics accumulators
             accumulated_loss_dpo = 0.0
             accumulated_loss_sft = 0.0
-            accumulated_rw = 0.0
-            accumulated_steps = 0
+            accumulated_rw       = 0.0
+            accumulated_steps    = 0
 
-            # ── ONLINE SYNC: Copy Policy weights to Reference weights ──
+            # ── Online ref sync ──────────────────────────────────────────
             if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
                 accelerator.wait_for_everyone()
-
                 with torch.no_grad():
                     state_dict = unwrapped_model.state_dict()
                     for name, param in unwrapped_model.named_parameters():
                         if "reference" in name:
-                            # Find the matching policy parameter name
                             policy_name = name.replace("reference", "policy")
                             if policy_name in state_dict:
-                                # Copy data directly (this is completely safe under DeepSpeed ZeRO
-                                # because local shard shapes match perfectly across adapters)
                                 param.data.copy_(state_dict[policy_name].data)
-
-                accelerator.print(f"[Ref] Synced policy adapter to reference adapter across GPUs.")
+                accelerator.print(
+                    f"[Ref] Synced policy → reference at step {global_step}."
+                )
 
         del ref_lp_chosen, ref_lp_rejected
         del pol_lp_chosen, pol_lp_rejected
@@ -1052,7 +1049,6 @@ def run_training_phase(
 
     accelerator.unwrap_model(model).gradient_checkpointing_disable()
     release_vram(accelerator, "end of training phase")
-
     return global_step
 
 
@@ -1215,7 +1211,7 @@ if __name__ == "__main__":
         num_epochs=1,
         inference_batch_size=96,  # generate batch
         max_judge_batch_size=48,  # judge batch at a time
-        batch_size=12,  # train 4 at a time (per-GPU)
+        batch_size=8,  # train 8 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
         ref_update_interval=200,
         wandb_project="gemma-online-dpo-sft"
