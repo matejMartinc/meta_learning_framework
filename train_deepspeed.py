@@ -1,5 +1,6 @@
-import json
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import json
 import random
 import dataclasses
 import torch
@@ -26,8 +27,6 @@ from io import BytesIO
 import concurrent.futures
 from openai import OpenAI
 
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 vllm_client = OpenAI(
     api_key="EMPTY",
@@ -65,14 +64,13 @@ class FrameworkConfig:
     num_epochs: int = 1
     inference_batch_size: int = 32  # large batch for generation
     max_judge_batch_size: int = 8  # max batch size for judging
-    batch_size: int = 4  # smaller sub-batch for SFT + DPO training
-    grad_accumulation_steps: int = 1
+    batch_size: int = 2  # smaller sub-batch for SFT + DPO training
+    grad_accumulation_steps: int = 2
     warmup_steps: int = 200
-    cosine_cycle_steps: int = 200
     sft_loss_weight: float = 0.4
     output_dir: str = "./checkpoints"
 
-    ref_update_interval: int = 100
+    ref_update_interval: int = 200
 
     # Generation
     max_new_tokens: int = 1024
@@ -268,13 +266,15 @@ def generate_answers_batch(
     # -----------------------------------------------------------------------
     # 1. INSTANT LORA SYNC (Save to RAM Disk)
     # -----------------------------------------------------------------------
-    lora_path = "/dev/shm/policy_lora"
+    policy_lora_path = "/dev/shm/policy_lora"
+    reference_lora_path = "/dev/shm/reference_lora"
 
     # Only the main process needs to save the adapter
     if accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
         # Ensure we are saving the actively training policy adapter
-        unwrapped_model.save_pretrained(lora_path, selected_adapters=["policy"])
+        unwrapped_model.save_pretrained(policy_lora_path, selected_adapters=["policy"])
+        unwrapped_model.save_pretrained(reference_lora_path, selected_adapters=["reference"])
 
     # Force all GPUs to wait until the main process finishes writing to RAM disk
     accelerator.wait_for_everyone()
@@ -478,8 +478,6 @@ def judge_answers_batch(
     if not indices_to_judge:
         return results
 
-    # Path to where generate_answers_batch previously saved the LoRA weights
-    lora_path = "/dev/shm/policy_lora"
 
     # 3. Define the worker function for a single judgment
     def fetch_and_parse(idx: int):
@@ -514,9 +512,9 @@ def judge_answers_batch(
                 temperature=0.0,
                 extra_body={
                     "lora_request": {
-                        "lora_name": "policy",
-                        "lora_int_id": 1,
-                        "lora_local_path": "/dev/shm/policy_lora"
+                        "lora_name": "reference",
+                        "lora_int_id": 2,
+                        "lora_local_path": "/dev/shm/reference_lora"
                     }
                 }
             )
@@ -645,6 +643,7 @@ def run_inference_phase(
         cfg: FrameworkConfig,
         judge_system_prompt: str,
         accelerator: Accelerator,
+        global_step: int,
 ) -> list[Optional[TrainingExample]]:
     base_data_dir = os.path.dirname(cfg.data_path)
     questions, golds = [], []
@@ -710,8 +709,27 @@ def run_inference_phase(
     # ── Assemble TrainingExamples ────────────────────────────────────────
     output: list[Optional[TrainingExample]] = [None] * len(items)
 
+    # Define the log file path specific to this GPU to prevent write collisions
+    log_file_path = os.path.join(cfg.output_dir, f"generation_judge_logs_gpu{accelerator.process_index}.jsonl")
+
     for rank, orig_idx in enumerate(all_idx):
         scores_generated, scores_gs = judge_results[rank]
+        item_id = items[orig_idx].get("id", f"item_{orig_idx}")
+        log_record = {
+            "id": item_id,
+            "step": global_step,
+            "question": questions[orig_idx]["text"],
+            "gs_answer": golds[orig_idx],
+            "generated_answer": pass_clean_gens[rank],
+            "gs_score": scores_gs,
+            "generated_score": scores_generated
+        }
+
+        # Append as a single line
+        with open(log_file_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+        # -------------------------------------------------------------------
+
         base_weight_gen = aggregate_score(scores_generated, cfg)
         base_weight_gs = aggregate_score(scores_gs, cfg)
 
@@ -840,29 +858,37 @@ def compute_logprobs_and_sft(
     shift_logits = outputs.logits[:, :-1, :].contiguous()
     shift_labels = enc_f_batch["input_ids"][:, 1:].contiguous()
 
-    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-    ce_loss = loss_fct(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1)
-    )
-    ce_loss = ce_loss.view(len(prompts), -1)
-    token_lp = -ce_loss
-
+    # --- MEMORY FIX: Do not compute CrossEntropy on the full padded sequence ---
     results_lp = []
     sft_losses_per_ex = []
 
     for i, p_len in enumerate(prompt_lengths):
         s_len = seq_lengths[i]
-        completion_logprobs = token_lp[i, p_len - 1: s_len - 1]
-        results_lp.append(completion_logprobs.sum())
+
+        # Edge case safeguard
+        if s_len <= p_len:
+            results_lp.append(torch.tensor(0.0, device=shift_logits.device))
+            if compute_sft:
+                sft_losses_per_ex.append(torch.tensor(0.0, device=shift_logits.device))
+            continue
+
+        # 1. Slice OUT the prompt tokens. We only care about the completion tokens!
+        # This prevents PyTorch from allocating float32 memory for the prompt logits.
+        ex_logits = shift_logits[i, p_len - 1: s_len - 1]
+        ex_labels = shift_labels[i, p_len - 1: s_len - 1]
+
+        # 2. Calculate CE loss only on the generated tokens
+        ex_ce_loss = torch.nn.functional.cross_entropy(ex_logits, ex_labels, reduction='none')
+        ex_logprobs = -ex_ce_loss
+
+        results_lp.append(ex_logprobs.sum())
 
         if compute_sft:
-            if completion_logprobs.numel() > 0:
-                sft_losses_per_ex.append(-completion_logprobs.mean())
-            else:
-                sft_losses_per_ex.append(torch.tensor(0.0, device=token_lp.device))
+            sft_losses_per_ex.append(-ex_logprobs.mean())
 
-    # Stack SFT losses for individual weighting outside the function
+    # Free the massive full-sequence logits immediately to prevent buildup
+    del outputs, shift_logits, shift_labels
+
     sft_loss_tensor = torch.stack(sft_losses_per_ex) if compute_sft else None
 
     if no_grad:
@@ -969,7 +995,7 @@ def run_training_phase(
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
 
             optimizer.step()
-            scheduler.step()
+            #scheduler.step()
             optimizer.zero_grad()
 
         # Only log properly when gradients actually stepped
@@ -1085,7 +1111,7 @@ def train_online(
 
             # ── INFERENCE PHASE ─────
             examples = run_inference_phase(
-                inf_items, model, processor, guardrail, cfg, judge_system_prompt, accelerator
+                inf_items, model, processor, guardrail, cfg, judge_system_prompt, accelerator, global_step
             )
 
             valid_examples = [ex for ex in examples if ex is not None]
@@ -1154,7 +1180,7 @@ def load_jsonl(path: str) -> list[dict]:
 # Main
 # ---------------------------------------------------------------------------
 def main(cfg: FrameworkConfig):
-    accelerator = Accelerator(log_with="wandb")
+    accelerator = Accelerator(log_with="wandb", gradient_accumulation_steps=cfg.grad_accumulation_steps)
 
     # Initialize trackers if on main process
     if accelerator.is_main_process:
@@ -1187,11 +1213,11 @@ if __name__ == "__main__":
         #data_path="data/nemotron_sft_all_final_5k_sample.jsonl",
         data_path = "data/train_gams_nemotron.jsonl",
         num_epochs=1,
-        inference_batch_size=48,  # generate batch
-        max_judge_batch_size=24,  # judge batch at a time
-        batch_size=6,  # train 4 at a time (per-GPU)
+        inference_batch_size=96,  # generate batch
+        max_judge_batch_size=48,  # judge batch at a time
+        batch_size=12,  # train 4 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
-        ref_update_interval=100,
+        ref_update_interval=200,
         wandb_project="gemma-online-dpo-sft"
     )
     main(cfg)

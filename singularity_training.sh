@@ -23,6 +23,7 @@ echo "Starting vLLM on GPU 0, port $PORT..."
 # Run vLLM directly (no srun) — stays alive as a background process on this node
 CUDA_VISIBLE_DEVICES=0 singularity exec --nv \
     --env CUDA_VISIBLE_DEVICES=0 \
+    --env PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
     --env http_proxy="" \
     --env https_proxy="" \
     --env HTTP_PROXY="" \
@@ -31,7 +32,9 @@ CUDA_VISIBLE_DEVICES=0 singularity exec --nv \
     vllm serve google/gemma-3-12b-it \
     --enable-lora \
     --max-lora-rank 16 \
-    --port $PORT &
+    --port $PORT \
+    --disable-uvicorn-access-log \
+    --disable-log-stats &
 VLLM_PID=$!
 
 echo "Waiting for vLLM to initialize..."
@@ -43,9 +46,10 @@ echo "vLLM is ready!"
 export VLLM_API_URL="http://localhost:$PORT/v1"
 echo "Starting DeepSpeed training on GPUs 1,2,3..."
 
-srun --overlap --ntasks=1 --gpus=3 \
+srun --overlap --ntasks=1 \
     singularity exec --nv \
     --env CUDA_VISIBLE_DEVICES=1,2,3 \
+    --env PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
     --env http_proxy=http://www-proxy.ijs.si:8080 \
     --env https_proxy=http://www-proxy.ijs.si:8080 \
     --env HTTP_PROXY=http://www-proxy.ijs.si:8080 \
