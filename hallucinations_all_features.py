@@ -7,6 +7,8 @@ from sklearn.metrics import classification_report
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+
 import json
 import pandas as pd
 import ast
@@ -65,7 +67,7 @@ def get_grounding_features_from_sequence(model, full_sequence_cpu, input_len, pa
             raw_embeds = model.get_input_embeddings()(prefix_ids)
             inputs_embeds = raw_embeds.detach().clone().requires_grad_(True)
 
-            outputs = model(inputs_embeds=inputs_embeds)
+            outputs = model(inputs_embeds=inputs_embeds, output_attentions=False)
             logits = outputs.logits[0, -1, :]
 
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
@@ -76,7 +78,10 @@ def get_grounding_features_from_sequence(model, full_sequence_cpu, input_len, pa
             target_log_prob.backward()
 
             prompt_grads = inputs_embeds.grad[0, :input_len, :]
-            grounding_score = prompt_grads.norm().item()
+
+            token_gradient_norms = prompt_grads.norm(dim=-1)
+            # Take the mean (or max) across all prompt tokens
+            grounding_score = token_gradient_norms.mean().item()
             grounding_scores.append(grounding_score)
 
             # Memory cleanup
@@ -177,27 +182,35 @@ for item in dataset_train:
     print("GS:", gs)
 
     with torch.no_grad():
+        # 1. Generate text (Turn OFF output_attentions here to save massive VRAM!)
         outputs = model.generate(
             input_ids,
             max_new_tokens=50,
             return_dict_in_generate=True,
-            output_attentions=True
+            output_attentions = False
         )
 
         # Decode answer before clearing outputs
-    answer = tokenizer.decode(outputs.sequences[0][input_len:], skip_special_tokens=True)
+        answer = tokenizer.decode(outputs.sequences[0][input_len:], skip_special_tokens=True)
 
-    # Secure the full sequence to CPU for grounding extraction later
-    full_sequence_cpu = outputs.sequences[0].detach().cpu()
+        # Secure the full sequence to CPU for grounding extraction later
+        full_sequence_cpu = outputs.sequences[0].detach().cpu()
+
+        # 2. NEW: Do a single forward pass to get the full NxN square attention matrices
+        full_out = model(
+            full_sequence_cpu.unsqueeze(0).to(model.device),
+            output_attentions=True
+        )
 
     # --- FEATURE 1: Attention Matrix Features ---
-    final_step_attentions = outputs.attentions[-1]
+    # Loop over the attentions from our single forward pass
     all_layer_features = []
 
-    for layer_idx in range(len(final_step_attentions)):
-        layer_tensor = final_step_attentions[layer_idx]
+    for layer_idx in range(len(full_out.attentions)):
+        # This is now a true (batch, num_heads, full_seq_len, full_seq_len) tensor
+        layer_tensor = full_out.attentions[layer_idx]
 
-        # This function now natively returns a CPU tensor
+        # Process exactly as before
         layer_evs = get_laplacian_features_for_layer(layer_tensor, k=5)
         all_layer_features.append(layer_evs)
 
@@ -208,7 +221,7 @@ for item in dataset_train:
 
     # --- CRITICAL: CLEAR HEAVY GENERATION ARTIFACTS BEFORE GRADIENTS ---
     del outputs
-    del final_step_attentions
+    del full_out  # We delete full_out instead of final_step_attentions
     del input_ids
     torch.cuda.empty_cache()  # Flush VRAM
 
@@ -219,6 +232,8 @@ for item in dataset_train:
 
     # Flush VRAM again after gradients
     torch.cuda.empty_cache()
+    num_ground_features = 57 #len(grounding_features)
+    #print(num_ground_features==57)
 
     combined_features = np.concatenate([attn_features, grounding_features])
 
@@ -253,9 +268,20 @@ y = np.array(collected_data_csv["label"])
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
+num_total_features = X_train.shape[1]
+num_attn_features = num_total_features - num_ground_features
+preprocessor = ColumnTransformer(
+    transformers=[
+        # Apply PCA only to the attention features
+        ('attn_pca', PCA(n_components=100), slice(0, num_attn_features)),
+        # Let the 57 grounding features pass through untouched
+        ('grounding_pass', 'passthrough', slice(num_attn_features, num_total_features))
+    ]
+)
+
 pipeline = Pipeline([
     ('scaler', StandardScaler()),
-    ('pca', PCA(n_components=100)),
+    ('preprocessor', preprocessor), # Replaces the global PCA
     ('clf', LogisticRegression(class_weight='balanced'))
 ])
 

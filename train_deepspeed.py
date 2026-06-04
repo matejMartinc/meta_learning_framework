@@ -1003,23 +1003,22 @@ def run_training_phase(
 
         if accelerator.sync_gradients:
             global_step += 1
-            #scheduler.step()  # <-- move here, after optimizer.step()
-
+            scheduler.step()
             avg_dpo = accumulated_loss_dpo / accumulated_steps
             avg_sft = accumulated_loss_sft / accumulated_steps
             avg_rw  = accumulated_rw       / accumulated_steps
 
             accelerator.log({
-                "train/loss_total":    loss.item(),
-                "train/loss_dpo":      avg_dpo,
-                "train/loss_sft":      avg_sft,
+                "train/loss_total": loss.item(),
+                "train/loss_dpo": avg_dpo,
+                "train/loss_sft": avg_sft,
                 "train/reward_weight": avg_rw,
-                "train/learning_rate": optimizer.param_groups[0]["lr"],
-                "train/global_step":   global_step,
+                "train/learning_rate": scheduler.get_last_lr()[0],
+                "train/global_step": global_step,
             }, step=global_step)
 
             accelerator.print(
-                f"  Step {global_step:4d} | loss={loss.item():.4f} "
+                f"  Step {global_step:4d} | loss={loss.item():.4f} | LR={scheduler.get_last_lr()[0]:.8f}"
                 f"| dpo={avg_dpo:.4f} | sft={avg_sft:.4f} | rw={avg_rw:.4f}"
             )
 
@@ -1081,8 +1080,9 @@ def train_online(
 
     scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=max(1, total_expected_steps),
+        # Multiply by num_processes to offset the internal division
+        num_warmup_steps=cfg.warmup_steps * accelerator.num_processes,
+        num_training_steps=max(1, total_expected_steps * accelerator.num_processes),
         num_cycles=cfg.num_epochs,
     )
 
