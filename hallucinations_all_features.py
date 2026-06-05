@@ -41,7 +41,7 @@ def get_laplacian_features_for_layer(layer_attn_tensor, k=5):
         padding = torch.zeros((num_heads, k - seq_len), device=device)
         top_vals = torch.cat([top_vals, padding], dim=-1)
 
-    log_det = lap_diag.add(1e-6).log().mean(dim=-1, keepdim=True)
+    log_det = lap_diag.clamp(min=1e-6).log().mean(dim=-1, keepdim=True)
 
     # Return directly to CPU to avoid hoarding GPU memory
     result = torch.cat([top_vals, log_det], dim=-1).flatten().detach().cpu()
@@ -136,8 +136,6 @@ Respond with exactly one word: 'YES' (for hallucination) or 'NO' (for factual)."
     torch.cuda.empty_cache()
 
     return 1 if "YES" in judge_output else 0
-
-
 
 
 # 1. SETUP MODEL & DATA
@@ -261,15 +259,23 @@ print(f"Successfully saved {len(collected_data)} records to JSON and CSV.")
 
 # 4. ENHANCED TRAIN & TEST
 collected_data_csv = pd.read_csv("results/hallucination_data.csv", encoding='utf8')
-collected_data_csv['features'] = collected_data_csv['features'].apply(ast.literal_eval)
+collected_data_csv['features'] = collected_data_csv['features'].apply(
+    lambda x: eval(x, {"nan": np.nan, "inf": np.inf, "-inf": -np.inf})
+)
 
 X = np.array(collected_data_csv["features"].tolist())
+X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
 y = np.array(collected_data_csv["label"])
+y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 num_total_features = X_train.shape[1]
-num_attn_features = num_total_features - num_ground_features
+num_attn_features = num_total_features - 57 #num_ground_features
 preprocessor = ColumnTransformer(
     transformers=[
         # Apply PCA only to the attention features
@@ -289,3 +295,13 @@ pipeline.fit(X_train, y_train)
 preds = pipeline.predict(X_test)
 
 print(classification_report(y_test, preds))
+
+
+#              precision    recall  f1-score   support
+#
+#           0       0.80      0.71      0.75      1257
+#           1       0.58      0.69      0.63       743
+#
+#    accuracy                           0.70      2000
+#   macro avg       0.69      0.70      0.69      2000
+#weighted avg       0.72      0.70      0.71      2000
