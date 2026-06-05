@@ -831,8 +831,13 @@ def compute_logprobs_and_sft(
     processor.tokenizer.padding_side = "right"
 
     def _single_forward(completions):
+        # Dynamically fetch the model's correct EOS token (e.g., "<end_of_turn>" for Gemma)
+        eos = processor.tokenizer.eos_token
+
+        # Append it cleanly without hardcoding string values
+        formatted_texts = [p + c + eos for p, c in zip(prompts, completions)]
         enc = processor(
-            text=[p + c for p, c in zip(prompts, completions)],
+            text=formatted_texts,
             images=batch_imgs if has_any_image else None,
             return_tensors="pt",
             padding=True,

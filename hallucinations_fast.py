@@ -223,7 +223,7 @@ def main():
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
         ('preprocessor', preprocessor),
-        ('clf', LogisticRegression(class_weight='balanced', max_iter=1000))
+        ('clf', LogisticRegression(class_weight='balanced'))
     ])
 
     pipeline.fit(X_train, y_train)
