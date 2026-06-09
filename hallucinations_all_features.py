@@ -305,3 +305,5 @@ print(classification_report(y_test, preds))
 #    accuracy                           0.70      2000
 #   macro avg       0.69      0.70      0.69      2000
 #weighted avg       0.72      0.70      0.71      2000
+
+

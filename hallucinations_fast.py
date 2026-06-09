@@ -17,6 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # --- vLLM Imports ---
 from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_model_parallel
+from threadpoolctl import threadpool_limits
 
 
 def load_json(path: str) -> list[dict]:
@@ -220,15 +221,25 @@ def main():
         ]
     )
 
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('preprocessor', preprocessor),
-        ('clf', LogisticRegression(class_weight='balanced'))
-    ])
+    pipeline = Pipeline([('scaler_in', StandardScaler()),  # 1. Scale the raw 7688 features (Good for PCA)
+                         ('preprocessor', preprocessor),  # 2. Run PCA on the 7680 hidden features
+                         ('scaler_out', StandardScaler()),
+                         ('clf', LogisticRegression(max_iter=500, class_weight='balanced'))])
 
-    pipeline.fit(X_train, y_train)
-    preds = pipeline.predict(X_test)
+    with threadpool_limits(limits=1, user_api='blas'):
+        pipeline.fit(X_train, y_train)
+        preds = pipeline.predict(X_test)
 
     print(classification_report(y_test, preds))
 if __name__ == "__main__":
     main()
+
+# Training on 7680 Hidden State features and 8 Logprob features.
+#               precision    recall  f1-score   support
+#
+#            0       0.77      0.72      0.74      1169
+#            1       0.64      0.69      0.66       831
+#
+#     accuracy                           0.71      2000
+#    macro avg       0.70      0.71      0.70      2000
+# weighted avg       0.71      0.71      0.71      2000
