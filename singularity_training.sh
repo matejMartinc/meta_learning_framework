@@ -28,6 +28,7 @@ CUDA_VISIBLE_DEVICES=0 singularity exec --nv \
     --env https_proxy="" \
     --env HTTP_PROXY="" \
     --env HTTPS_PROXY="" \
+    --env HF_TOKEN="" \
     --bind /etc/passwd,/etc/group,/dev/shm:/dev/shm out/pytorch_nn.sif \
     vllm serve google/gemma-3-12b-it \
     --enable-lora \
@@ -56,6 +57,7 @@ srun --overlap --ntasks=1 \
     --env HTTPS_PROXY=http://www-proxy.ijs.si:8080 \
     --env no_proxy=127.0.0.0/8,localhost,127.0.0.1,::1 \
     --env NO_PROXY=127.0.0.0/8,localhost,127.0.0.1,::1 \
+    --env HF_TOKEN="" \
     --env VLLM_API_URL="http://localhost:$PORT/v1" \
     --bind /etc/passwd,/etc/group,/dev/shm:/dev/shm out/pytorch_nn.sif \
     accelerate launch --config_file accelerate_config.yaml train_deepspeed.py
