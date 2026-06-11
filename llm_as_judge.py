@@ -5,13 +5,13 @@ import google.generativeai as genai
 from typing import List, Dict
 
 # --- Configuration ---
-GOOGLE_API_KEY = "API key"
+GOOGLE_API_KEY = "Api key"
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # List of your model result files (JSONL format)
 MODEL_RESULT_FILES = [
-    #"results/gemma-3-12b-it_meta_improved_predictions.jsonl",
-    "results/gemma-3-12b-it_meta_epoch_1_100k_predictions.jsonl",
+    "results/gemma-3-12b-it_epoch_1_debugged_meta_learning_predictions.jsonl",
+    "results/gemma-3-12b-it_sft_predictions.jsonl",
     "results/gemma-3-12b-it_base_predictions.jsonl"
 ]
 
