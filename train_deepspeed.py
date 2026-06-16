@@ -5,7 +5,6 @@ import random
 import dataclasses
 import torch
 import torch.nn.functional as F
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from PIL import Image
@@ -26,6 +25,7 @@ import base64
 from io import BytesIO
 import concurrent.futures
 from openai import OpenAI
+import re
 
 
 vllm_client = OpenAI(
@@ -46,8 +46,8 @@ class FrameworkConfig:
     max_seq_len: int = (2 * 1024) + 256
 
     # Semantic guardrail
-    semantic_model_name: str = "all-MiniLM-L6-v2"
-    min_cosine_similarity: float = 0.35
+    semantic_model_name: str = "intfloat/multilingual-e5-large"
+    min_cosine_similarity: float = 0.70  # e5-large requires a higher threshold (e.g., 0.70 - 0.85)
 
     # Judge criteria — drives the dynamic system prompt
     judge_criteria: list = field(default_factory=lambda: [
@@ -59,8 +59,8 @@ class FrameworkConfig:
     ])
 
     # Training
-    dpo_beta: float = 0.1
-    learning_rate: float = 5e-5
+    dpo_beta: float = 0.2
+    learning_rate: float = 2e-5
     num_epochs: int = 1
     inference_batch_size: int = 32  # large batch for generation
     max_judge_batch_size: int = 8  # max batch size for judging
@@ -73,50 +73,97 @@ class FrameworkConfig:
     ref_update_interval: int = 200
 
     # Generation
-    max_new_tokens: int = 1024
-    temperature: float = 0.7
-    top_p: float = 0.9
+    max_new_tokens: int = 1540
+    temperature: float = 0.3
+    top_p: float = 0.95
 
     # WandB
     wandb_project: str = "gemma-online-training"
 
+def is_slovenian(text: str) -> bool:
+    if not text or not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        return detect(text) == 'sl'
+    except:
+        return False
 
-# ---------------------------------------------------------------------------
-# Dynamic judge system prompt
-# ---------------------------------------------------------------------------
-def build_judge_system_prompt(criteria: list[str]) -> str:
-    criteria_lines = "\n".join(
-        f"{i + 1}. {c:<14} – {_criterion_description(c)}"
-        for i, c in enumerate(criteria)
-    )
-    criteria_keys = ", ".join(f'"{c}": <1-5>' for c in criteria)
+def build_general_judge_system_prompt(criteria: list[str]) -> str:
+    criteria_keys = ", ".join(f'"{c}": X' for c in criteria)
     return f"""\
-You are a strict but fair language judge. You will be given:
-    A QUESTION
-    ANSWER 1
-    ANSWER 2
+You are an expert, ruthlessly strict proofreader and linguist. Your job is to catch subtle AI generation or translation errors that most people miss.
 
-Your task is to score BOTH ANSWERS on these {len(criteria)} criteria (score 1–5, where 5 is best):
-{criteria_lines}
+WARNING: Do not just read for general meaning. You MUST read for exact grammatical correctness, natural flow, and morphological accuracy in the language of the prompt.
 
-Return ONLY a valid JSON object with exactly this structure:
+You will be given:
+A QUESTION
+ANSWER 1
+ANSWER 2
+
+You must evaluate both answers.
+
+Before scoring, you must complete an analysis checklist.
+
+CHECKLIST OF COMMON AI ERRORS TO HUNT FOR:
+1. Grammar/Syntax: Look closely at verb conjugations, noun cases/plurals, and article/particle usage.
+2. Literal/Clunky Translations: Phrases that sound like they were machine-translated and do not sound native to the language.
+3. Hallucinated Vocabulary: Words that do not exist or are completely misused in the given context.
+4. Coherence/Flow: Stilted, robotic sentences that lack natural cadence.
+
+STEP 1: GRAMMAR AND SYNTAX EXTRACTION
+For EACH answer, explicitly list at least 2-3 suspicious or grammatically incorrect phrases. If you think the text is perfect, look harder. Break down why the grammar is wrong or why it sounds unnatural.
+
+STEP 2: JUSTIFICATION
+Write a harsh critique of the answers based on your Step 1 extraction. Penalize errors heavily. 1 error = max score of 4. 3+ errors = max score of 2.
+
+STEP 3: JSON SCORES
+Score 1-5 for: grammar, semantics, flow, completeness, clarity.
+Structure your final JSON exactly like this inside markdown fences:
+```json
 {{
     "ANSWER 1": {{{criteria_keys}}},
     "ANSWER 2": {{{criteria_keys}}}
 }}
+```\n"""
+# ---------------------------------------------------------------------------
+# Dynamic judge system prompt
+# ---------------------------------------------------------------------------
+def build_judge_system_prompt(criteria: list[str]) -> str:
+    criteria_keys = ", ".join(f'"{c}": X' for c in criteria)
+    return f"""\
+You are an expert, ruthlessly strict proofreader and linguist for the Slovenian language. Your job is to catch subtle AI translation errors that most people miss.
 
-Do NOT add any explanation, markdown, or extra text."""
+WARNING: Do not read for general meaning. You MUST read for exact morphological correctness (sklanjatev, spreganje, ujemanje v spolu in številu). 
 
+You will be given:
+A QUESTION
+ANSWER 1
+ANSWER 2
 
-def _criterion_description(name: str) -> str:
-    return {
-        "grammar": "grammatical and linguistic correctness",
-        "semantics": "semantic accuracy and factual correctness",
-        "flow": "readability, coherence, and logical flow",
-        "completeness": "how thoroughly the answer covers the topic",
-        "clarity": "simplicity and clarity of explanation",
-    }.get(name, name)
+You must evaluate both answers.
 
+Before scoring, you must complete an analysis checklist.
+
+CHECKLIST OF COMMON AI ERRORS IN SLOVENIAN TO HUNT FOR:
+1. Case/Gender/Number Mismatch: Look closely at adjectives and nouns. (e.g., "pomitega krožnike" is wrong, it must be "pomite krožnike").
+2. Plural vs. Singular: Check words that are 'plurale tantum' (e.g., "prsi" is plural, not singular).
+3. Croatian/Serbian Interference: AI often uses "celere" instead of "zelena", "šargarepa" instead of "korenje", or "juha" structure errors.
+4. Literal English Calques (Anglicisms): "Nizek na ogljikove hidrate" (Low in carbs) is terrible Slovenian. It should be "z malo ogljikovimi hidrati". 
+5. Hallucinated Vocabulary: Words that sound Slovenian but don't exist in this context (e.g., "rocajte" is wrong, "samodržavja" is wrong).
+
+STEP 1: GRAMMAR AND SYNTAX EXTRACTION
+For EACH answer, explicitly list at least 3 suspicious or grammatically incorrect phrases. If you think the text is perfect, look harder. Break down why the case (sklad) or gender (spol) is wrong, or why it sounds like an English translation.
+
+STEP 2: JUSTIFICATION
+Write a harsh critique of the answers based on your Step 1 extraction. Penalize errors heavily. 1 error = max score of 4. 3+ errors = max score of 2.
+
+STEP 3: JSON SCORES
+Score 1-5 for: grammar, semantics, flow, completeness, clarity.
+Structure your final JSON exactly like this inside markdown fences:
+{{
+    "ANSWER 1": {{{criteria_keys}}},
+    "ANSWER 2": {{{criteria_keys}}}
+}}\n"""
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -154,15 +201,19 @@ def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
     # 3. Add the second adapter ("reference")
     model.add_adapter("reference", lora_config)
 
+    max_layer = 0
+    model.layer_grad_scales = {}
+
     # 4. Set requires_grad rules
     for name, param in model.named_parameters():
         if "reference" in name:
-            param.requires_grad_(False)  # Ref adapter is frozen during training
+            param.requires_grad_(False)
         elif "policy" in name:
-            param.requires_grad_(True)  # Policy adapter is trained
+            param.requires_grad_(True)
         else:
-            param.requires_grad_(False)  # Base model is frozen
+            param.requires_grad_(False)
 
+    model.max_layer_idx = max_layer
     return model, processor
 
 
@@ -177,8 +228,6 @@ def release_vram(accelerator: Accelerator, label: str = "") -> None:
     gc.collect()
     torch.cuda.empty_cache()
     # accelerator.print(f"[VRAM] [{label}] Cache cleared.") # Un-comment to trace memory
-
-
 
 
 def encode_image_base64(img) -> str:
@@ -203,12 +252,15 @@ def generate_answers_batch(
     policy_lora_path = "/dev/shm/policy_lora"
     reference_lora_path = "/dev/shm/reference_lora"
 
+    accelerator.wait_for_everyone()
+    state_dict = accelerator.get_state_dict(model)
+
     # Only the main process needs to save the adapter
     if accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
         # Ensure we are saving the actively training policy adapter
-        unwrapped_model.save_pretrained(policy_lora_path, selected_adapters=["policy"])
-        unwrapped_model.save_pretrained(reference_lora_path, selected_adapters=["reference"])
+        unwrapped_model.save_pretrained(policy_lora_path, selected_adapters=["policy"], state_dict=state_dict)
+        unwrapped_model.save_pretrained(reference_lora_path, selected_adapters=["reference"], state_dict=state_dict)
 
     # Force all GPUs to wait until the main process finishes writing to RAM disk
     accelerator.wait_for_everyone()
@@ -264,34 +316,27 @@ def judge_answers_batch(
         questions: list[dict],
         generated_answers: list[str],
         gold_answers: list[str],
-        filtered_idx: list[int],
+        filtered_idx: set[int],
+        non_sl_idx: set[int],
         cfg: FrameworkConfig,
-        judge_system_prompt: str,
+        sl_judge_system_prompt: str,
+        general_judge_system_prompt: str,
         accelerator: Accelerator,
 ) -> list[tuple[dict, dict]]:
     num_examples = len(questions)
     results = [None] * num_examples
-    filtered_set = set(filtered_idx)
 
-    # 1. Immediately handle auto-scored (discarded) examples
-    for idx in filtered_idx:
-        results[idx] = (
-            {k: 1 for k in cfg.judge_criteria},
-            {k: 5 for k in cfg.judge_criteria}
-        )
 
-    # 2. Identify indices that actually need the LLM
-    indices_to_judge = [i for i in range(num_examples) if i not in filtered_set]
-
-    if not indices_to_judge:
-        return results
-
+    indices_to_judge = list(range(num_examples))
 
     # 3. Define the worker function for a single judgment
     def fetch_and_parse(idx: int):
         q_dict = questions[idx]
         gen_ans = generated_answers[idx]
         gold_ans = gold_answers[idx]
+
+        # Select the correct prompt based on language
+        current_prompt = general_judge_system_prompt if idx in non_sl_idx else sl_judge_system_prompt
 
         # Randomize order to prevent LLM position bias
         if random.randint(0, 1) == 0:
@@ -303,7 +348,7 @@ def judge_answers_batch(
         user_content = f"QUESTION:\n{clean_text}\n\nANSWER 1:\n{a1}\n\nANSWER 2:\n{a2}"
 
         # Construct OpenAI API-style messages
-        content = [{"type": "text", "text": judge_system_prompt + user_content}]
+        content = [{"type": "text", "text": current_prompt + user_content}]
         if q_dict["image"] is not None:
             base64_image = encode_image_base64(q_dict["image"])
             content.insert(0, {
@@ -316,8 +361,9 @@ def judge_answers_batch(
             response = vllm_client.chat.completions.create(
                 model="google/gemma-3-12b-it",  # <-- always the base model name
                 messages=[{"role": "user", "content": content}],
-                max_tokens=128,
-                temperature=0.0,
+                max_tokens=cfg.max_new_tokens,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
                 extra_body={
                     "lora_request": {
                         "lora_name": "reference",
@@ -326,18 +372,24 @@ def judge_answers_batch(
                     }
                 }
             )
-
-
-
             raw = response.choices[0].message.content.strip()
         except Exception as e:
             return idx, False, str(e), None
 
         # Step B: Parse JSON Output
         try:
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
-            scores = json.loads(cleaned)
-            scores_generated = scores[gen_key]
+            match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+            if match:
+                json_string = match.group(1)
+            else:
+                start_idx = raw.find('{')
+                end_idx = raw.rfind('}')
+                json_string = raw[start_idx:end_idx + 1]
+            scores = json.loads(json_string)
+            if idx in filtered_idx:
+                scores_generated = {k: 1 for k in cfg.judge_criteria}
+            else:
+                scores_generated = scores[gen_key]
             scores_gs = scores[gs_key]
 
             for k in cfg.judge_criteria:
@@ -369,12 +421,6 @@ def judge_answers_batch(
 
     return results
 
-
-def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
-    vals = [scores.get(k, 3) for k in cfg.judge_criteria]
-    return (sum(vals) / len(vals) - 1) / 4.0
-
-
 # ---------------------------------------------------------------------------
 # Semantic guardrail (vectorised, text only)
 # ---------------------------------------------------------------------------
@@ -405,6 +451,18 @@ class SemanticGuardrail:
         return keep
 
 
+def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
+    # 1. STRICT VETO: If any single criterion is <= 2, the entire answer fails.
+    for k in cfg.judge_criteria:
+        if scores.get(k, 3) <= 2:
+            return 0.1
+
+    # 2. EQUAL AGGREGATION: If it survives the veto, average all scores equally.
+    vals = [scores.get(k, 3) for k in cfg.judge_criteria]
+    mean_score = sum(vals) / len(vals)
+
+    # Normalize from a 1-5 scale to a 0.0-1.0 scale
+    return (mean_score - 1) / 4.0
 # ---------------------------------------------------------------------------
 # Training example dataclass
 # ---------------------------------------------------------------------------
@@ -416,9 +474,9 @@ class TrainingExample:
     chosen_completion: str
     rejected_completion: str
     reward_weight: float
+    sft_weight: float
     judge_prompt: str
     judge_response: str
-
 
 # ---------------------------------------------------------------------------
 # DPO prompt builder
@@ -449,11 +507,12 @@ def run_inference_phase(
         processor,
         guardrail: SemanticGuardrail,
         cfg: FrameworkConfig,
-        judge_system_prompt: str,
         accelerator: Accelerator,
         global_step: int,
 ) -> list[Optional[TrainingExample]]:
     base_data_dir = os.path.dirname(cfg.data_path)
+    sl_judge_system_prompt = build_judge_system_prompt(cfg.judge_criteria)
+    general_judge_system_prompt = build_general_judge_system_prompt(cfg.judge_criteria)
     questions, golds = [], []
     for item in items:
         raw_convs = item.get("conversations", [])
@@ -483,23 +542,20 @@ def run_inference_phase(
     unwrapped_model.set_adapter("policy")
 
     generated_raw = generate_answers_batch(model, processor, questions, cfg, accelerator)
-    #accelerator.print("---------------------Questions:\n----------------------")
-    #accelerator.print(questions)
-    #accelerator.print("---------------------Generated text:\n----------------------")
-    #accelerator.print(generated_raw)
-    #accelerator.print("---------------------GS text:\n----------------------")
-    #accelerator.print(golds)
-    #accelerator.print("------------------------------------------------------------")
-
-
+    non_sl_idx = set()
+    for i, (q_dict, g_text) in enumerate(zip(questions, golds)):
+        if not is_slovenian(q_dict["text"]) and not is_slovenian(g_text):
+            non_sl_idx.add(i)
     # ── Phase 2: semantic guardrail ──────────────────────────────────────
     keep_mask = guardrail.filter_batch(generated_raw, golds, cfg.min_cosine_similarity)
 
-    filtered_idx = [i for i, keep in enumerate(keep_mask) if not keep]
-    all_idx = [i for i, keep in enumerate(keep_mask)]
-    for i, keep in enumerate(keep_mask):
-        if not keep:
-            accelerator.print(f"[Guardrail] item {i} DISCARDED — too far from gold or wrong language.")
+    filtered_idx = set([i for i, keep in enumerate(keep_mask) if not keep])
+
+    for i in filtered_idx:
+        accelerator.print(f"[Guardrail] item {i} DISCARDED — too far from gold. (Will still judge GS)")
+
+    accelerator.print(
+        f"[Lang Check] Found {len(non_sl_idx)} non-Slovenian items. Using general judge prompt for these.")
 
     pass_questions = [q for q in questions]
     pass_clean_gens = [c for c in generated_raw]
@@ -508,10 +564,16 @@ def run_inference_phase(
     # ── Phase 3: judging ─────────────────────────────────────────────────
     accelerator.print(f"[Inference] Judging {len(pass_questions) - len(filtered_idx)} surviving answers …")
 
+    # Pass everything to the judge, with the indices routing the prompts
     judge_results = judge_answers_batch(
         model, processor,
-        pass_questions, pass_clean_gens, pass_golds, filtered_idx,
-        cfg, judge_system_prompt, accelerator
+        pass_questions, pass_clean_gens, pass_golds,
+        filtered_idx=filtered_idx,
+        non_sl_idx=non_sl_idx,
+        cfg=cfg,
+        sl_judge_system_prompt=sl_judge_system_prompt,
+        general_judge_system_prompt=general_judge_system_prompt,
+        accelerator=accelerator
     )
 
     # ── Assemble TrainingExamples ────────────────────────────────────────
@@ -520,7 +582,7 @@ def run_inference_phase(
     # Define the log file path specific to this GPU to prevent write collisions
     log_file_path = os.path.join(cfg.output_dir, f"generation_judge_logs_gpu{accelerator.process_index}.jsonl")
 
-    for rank, orig_idx in enumerate(all_idx):
+    for rank, orig_idx in enumerate(range(len(questions))):
         scores_generated, scores_gs = judge_results[rank]
         item_id = items[orig_idx].get("id", f"item_{orig_idx}")
         log_record = {
@@ -536,24 +598,8 @@ def run_inference_phase(
         # Append as a single line
         with open(log_file_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
-        # -------------------------------------------------------------------
 
-        base_weight_gen = aggregate_score(scores_generated, cfg)
-        base_weight_gs = aggregate_score(scores_gs, cfg)
-
-        score_delta = abs(base_weight_gen - base_weight_gs)
-        #score_chosen = max(base_weight_gen, base_weight_gs)
-        #reward_weight = min(1.0, max(score_chosen, score_delta))
-        reward_weight = min(1.0, score_delta)
-
-        dpo_prompt = build_dpo_prompt(questions[orig_idx], processor)
-
-        if base_weight_gen > base_weight_gs:
-            chosen_completion = generated_raw[orig_idx]
-            rejected_completion = golds[orig_idx]
-        else:
-            chosen_completion = golds[orig_idx]
-            rejected_completion = generated_raw[orig_idx]
+        is_non_sl = orig_idx in non_sl_idx
 
         clean_text = questions[orig_idx]["text"].replace("<image>\n", "").replace("<image>", "")
         sft_user = (
@@ -562,21 +608,57 @@ def run_inference_phase(
             f"ANSWER 2:\n{golds[orig_idx]}"
         )
         content_list = []
+
         if questions[orig_idx]["image"] is not None:
             content_list.append({"type": "image"})
         content_list.append({"type": "text", "text": sft_user})
-
+        if is_non_sl:
+            judge_system_prompt = general_judge_system_prompt
+        else:
+            judge_system_prompt = sl_judge_system_prompt
         judge_prompt = processor.apply_chat_template(
             [{"role": "system", "content": judge_system_prompt},
-             {"role": "user", "content": content_list}],
-            tokenize=False, add_generation_prompt=True,
-        )
+            {"role": "user", "content": content_list}],
+            tokenize = False, add_generation_prompt = True,)
 
         judge_response = json.dumps(
-            {"ANSWER 1": scores_generated, "ANSWER 2": scores_gs},
-            ensure_ascii=False,
-        )
+            {"ANSWER 1": scores_generated,
+             "ANSWER 2": scores_gs},
+            ensure_ascii = False,)
 
+        base_weight_gen = aggregate_score(scores_generated, cfg)
+        base_weight_gs = aggregate_score(scores_gs, cfg)
+
+        score_delta = abs(base_weight_gen - base_weight_gs)
+
+        if base_weight_gen > base_weight_gs:
+            chosen_completion = pass_clean_gens[rank]
+            rejected_completion = pass_golds[rank]
+            chosen_scores = scores_generated
+        else:
+            chosen_completion = pass_golds[rank]
+            rejected_completion = pass_clean_gens[rank]
+            chosen_scores = scores_gs
+
+        chosen_grammar = chosen_scores.get("grammar", 1)
+        chosen_semantics = chosen_scores.get("semantics", 1)
+
+        # 1. DPO Weight: If both chosen and rejected are terribly flawed, ignore it.
+        if chosen_grammar <= 2 and chosen_semantics <= 2:
+            reward_weight = 0.0
+        else:
+            reward_weight = 1.0 if score_delta > 0.1 else 0.5
+
+        # 2. SFT Weight: STRICT grammar filter.
+        # If the chosen answer has bad grammar (< 4), DO NOT do SFT on it.
+        if chosen_grammar >= 4 and chosen_semantics >= 4:
+            sft_weight = min(1.0, score_delta)
+        else:
+            sft_weight = 0.0
+
+        dpo_prompt = build_dpo_prompt(questions[orig_idx], processor)
+
+        # We always populate the example (even if weights are 0.0) to prevent Distributed Deadlocks
         output[orig_idx] = TrainingExample(
             question_text=questions[orig_idx]["text"],
             question_image=questions[orig_idx]["image"],
@@ -584,8 +666,9 @@ def run_inference_phase(
             chosen_completion=chosen_completion,
             rejected_completion=rejected_completion,
             reward_weight=reward_weight,
+            sft_weight=sft_weight,
             judge_prompt=judge_prompt,
-            judge_response=judge_response,
+            judge_response = judge_response,
         )
 
     return output
@@ -596,20 +679,16 @@ def dpo_loss_weighted_batch(
         ref_lp_rejected: list[torch.Tensor],
         pol_lp_chosen: list[torch.Tensor],
         pol_lp_rejected: list[torch.Tensor],
-        beta: float,
-        reward_weights: list[float],
-) -> torch.Tensor:
+        beta: float, reward_weights: list[float],) -> torch.Tensor:
     losses = []
     for rc, rr, pc, pr, w in zip(
-            ref_lp_chosen, ref_lp_rejected,
-            pol_lp_chosen, pol_lp_rejected,
-            reward_weights,
+            ref_lp_chosen, ref_lp_rejected, pol_lp_chosen, pol_lp_rejected, reward_weights,
     ):
-        chosen_ratio = pc - rc
-        rejected_ratio = pr - rr
-        margin = beta * (chosen_ratio - rejected_ratio) * w
-        losses.append(-F.logsigmoid(margin))
-    return torch.stack(losses).mean()
+        margin = beta * ((pc - rc) - (pr - rr))
+        loss = -F.logsigmoid(margin)
+        losses.append(loss * w)  # FIX: Multiply LOSS by w, not the margin, for proper 0 gradients
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0)
 
 
 def compute_logprobs_and_sft(
@@ -748,13 +827,14 @@ def run_training_phase(
             f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {len(sub_batch)} examples"
         )
 
-        dpo_prompts          = [ex.dpo_prompt           for ex in sub_batch]
-        chosen_completions   = [ex.chosen_completion     for ex in sub_batch]
-        rejected_completions = [ex.rejected_completion   for ex in sub_batch]
-        reward_weights       = [ex.reward_weight         for ex in sub_batch]
-        images_list          = [ex.question_image        for ex in sub_batch]
-
         unwrapped_model = accelerator.unwrap_model(model)
+
+        dpo_prompts = [ex.dpo_prompt for ex in sub_batch]
+        chosen_completions = [ex.chosen_completion for ex in sub_batch]
+        rejected_completions = [ex.rejected_completion for ex in sub_batch]
+        reward_weights = [ex.reward_weight for ex in sub_batch]
+        sft_weights = [ex.sft_weight for ex in sub_batch]
+        images_list = [ex.question_image for ex in sub_batch]
 
         # ── 1. Reference log-probs — no grad ─────────────────────────────
         model.eval()
@@ -785,20 +865,15 @@ def run_training_phase(
             )
 
             loss_dpo = dpo_loss_weighted_batch(
-                ref_lp_chosen, ref_lp_rejected,
-                pol_lp_chosen, pol_lp_rejected,
-                beta=cfg.dpo_beta,
-                reward_weights=reward_weights,
+                ref_lp_chosen, ref_lp_rejected, pol_lp_chosen, pol_lp_rejected, cfg.dpo_beta, reward_weights
             )
 
-            rw_tensor = torch.tensor(
-                reward_weights,
-                device=sft_losses_per_ex.device,
-                dtype=sft_losses_per_ex.dtype,
-            )
-            loss_sft = (sft_losses_per_ex * rw_tensor).mean()
+            sft_w_tensor = torch.tensor(sft_weights, device=sft_losses_per_ex.device, dtype=sft_losses_per_ex.dtype)
+            loss_sft = (sft_losses_per_ex * sft_w_tensor).mean()
+
             loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
 
+            # The backward pass hook will automatically apply the layer 0.0 / 1.0 multiplier configured above!
             accelerator.backward(loss)
 
             accumulated_loss_dpo += loss_dpo.item()
@@ -878,7 +953,6 @@ def train_online(
         os.makedirs(cfg.output_dir, exist_ok=True)
 
     accelerator.unwrap_model(model).gradient_checkpointing_disable()
-    judge_system_prompt = build_judge_system_prompt(cfg.judge_criteria)
 
     min_len = (len(raw_data) // accelerator.num_processes) * accelerator.num_processes
     raw_data = raw_data[:min_len]
@@ -918,7 +992,7 @@ def train_online(
 
             # ── INFERENCE PHASE ─────
             examples = run_inference_phase(
-                inf_items, model, processor, guardrail, cfg, judge_system_prompt, accelerator, global_step
+                inf_items, model, processor, guardrail, cfg, accelerator, global_step
             )
 
             valid_examples = [ex for ex in examples if ex is not None]
@@ -949,11 +1023,12 @@ def train_online(
             # Check if we passed a multiple of k during this training phase
             if ((global_step * cfg.batch_size) // save_every_k_steps) > ((previous_step * cfg.batch_size) // save_every_k_steps):
                 accelerator.wait_for_everyone()
+                state_dict = accelerator.get_state_dict(model)
                 if accelerator.is_main_process:
                     ckpt = f"{cfg.output_dir}/step_{global_step}"
                     unwrapped_model = accelerator.unwrap_model(model)
                     unwrapped_model.set_adapter("policy")
-                    unwrapped_model.save_pretrained(ckpt, selected_adapters=["policy"])
+                    unwrapped_model.save_pretrained(ckpt, selected_adapters=["policy"], state_dict=state_dict)
                     processor.save_pretrained(ckpt)
                     accelerator.print(f"\n[Checkpoint] Step-based save at step {global_step} to {ckpt}")
 
@@ -962,11 +1037,12 @@ def train_online(
 
         # ── EPOCH-BASED CHECKPOINT ──
         accelerator.wait_for_everyone()
+        state_dict = accelerator.get_state_dict(model)
         if accelerator.is_main_process:
             ckpt = f"{cfg.output_dir}/epoch_{epoch + 1}"
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.set_adapter("policy")
-            unwrapped_model.save_pretrained(ckpt, selected_adapters=["policy"])
+            unwrapped_model.save_pretrained(ckpt, selected_adapters=["policy"], state_dict=state_dict)
             processor.save_pretrained(ckpt)
             accelerator.print(f"[Checkpoint] End of epoch save to {ckpt}")
 

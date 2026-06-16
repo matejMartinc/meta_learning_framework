@@ -5,17 +5,17 @@ import google.generativeai as genai
 from typing import List, Dict
 
 # --- Configuration ---
-GOOGLE_API_KEY = "Api key"
+GOOGLE_API_KEY = ""
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # List of your model result files (JSONL format)
 MODEL_RESULT_FILES = [
     "results/gemma-3-12b-it_epoch_1_debugged_meta_learning_predictions.jsonl",
-    "results/gemma-3-12b-it_sft_predictions.jsonl",
+    #"results/gemma-3-12b-it_sft_predictions.jsonl",
     "results/gemma-3-12b-it_base_predictions.jsonl"
 ]
 
-OUTPUT_FILE = "LLM_as_a_judge_scores.jsonl"
+OUTPUT_FILE = "LLM_as_a_judge_scores_2_models.jsonl"
 
 
 def load_jsonl_data(file_paths: List[str]) -> Dict[str, Dict]:
@@ -27,9 +27,9 @@ def load_jsonl_data(file_paths: List[str]) -> Dict[str, Dict]:
     for file_path in file_paths:
         model_tag = os.path.basename(file_path).replace(".jsonl", "")
         with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
+            for idx, line in enumerate(f):
                 item = json.loads(line)
-                item_id = item['id']
+                item_id = item['id'] + '_' + str(idx)
 
                 # Extract prompt and gold from the conversations list
                 # Assuming index 0 is human and index 1 is gpt gold
