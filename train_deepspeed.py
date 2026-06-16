@@ -168,6 +168,10 @@ Structure your final JSON exactly like this inside markdown fences:
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+def extract_layer_idx(name: str) -> Optional[int]:
+    match = re.search(r"layers\.(\d+)", name)
+    return int(match.group(1)) if match else None
+
 def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
     accelerator.print("[Init] Loading processor...")
     processor = AutoProcessor.from_pretrained(cfg.model_name)
@@ -204,7 +208,7 @@ def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
     max_layer = 0
     model.layer_grad_scales = {}
 
-    # 4. Set requires_grad rules
+    # 3. Set requires_grad rules
     for name, param in model.named_parameters():
         if "reference" in name:
             param.requires_grad_(False)
@@ -450,7 +454,6 @@ class SemanticGuardrail:
             keep.append(sim >= threshold and same_lang)
         return keep
 
-
 def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
     # 1. STRICT VETO: If any single criterion is <= 2, the entire answer fails.
     for k in cfg.judge_criteria:
@@ -463,6 +466,7 @@ def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
 
     # Normalize from a 1-5 scale to a 0.0-1.0 scale
     return (mean_score - 1) / 4.0
+
 # ---------------------------------------------------------------------------
 # Training example dataclass
 # ---------------------------------------------------------------------------
@@ -655,7 +659,6 @@ def run_inference_phase(
             sft_weight = min(1.0, score_delta)
         else:
             sft_weight = 0.0
-
         dpo_prompt = build_dpo_prompt(questions[orig_idx], processor)
 
         # We always populate the example (even if weights are 0.0) to prevent Distributed Deadlocks
@@ -828,7 +831,6 @@ def run_training_phase(
         )
 
         unwrapped_model = accelerator.unwrap_model(model)
-
         dpo_prompts = [ex.dpo_prompt for ex in sub_batch]
         chosen_completions = [ex.chosen_completion for ex in sub_batch]
         rejected_completions = [ex.rejected_completion for ex in sub_batch]
