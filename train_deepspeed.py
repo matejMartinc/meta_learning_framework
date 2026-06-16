@@ -168,10 +168,6 @@ Structure your final JSON exactly like this inside markdown fences:
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
-def extract_layer_idx(name: str) -> Optional[int]:
-    match = re.search(r"layers\.(\d+)", name)
-    return int(match.group(1)) if match else None
-
 def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
     accelerator.print("[Init] Loading processor...")
     processor = AutoProcessor.from_pretrained(cfg.model_name)
