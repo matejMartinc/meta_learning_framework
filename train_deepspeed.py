@@ -59,7 +59,6 @@ class FrameworkConfig:
     ])
 
     # Training
-
     orpo_beta: float = 0.2
     learning_rate: float = 2e-5
     num_epochs: int = 1
@@ -688,8 +687,15 @@ def orpo_loss_weighted_batch(
 ) -> torch.Tensor:
     losses = []
     for pc, pr, w in zip(pol_lp_chosen, pol_lp_rejected, reward_weights):
-        # ORPO requires average logprob per token (assuming pc and pr are means)
-        # Log Odds = log(P) - log(1 - P) -> implemented safely as log_P - log1p(-exp(log_P))
+        # 1. Cast to float32 to prevent bfloat16 underflow/overflow.
+        # In bfloat16, exp(-1e-5) rounds to exactly 1.0, causing log1p to return -inf.
+        pc = pc.float()
+        pr = pr.float()
+
+        # 2. Clamp to -1e-3 to prevent the derivative from exploding.
+        # At -1e-5, the gradient multiplier is 10^5, which causes weights to explode.
+        pc = torch.clamp(pc, max=-1e-3)
+        pr = torch.clamp(pr, max=-1e-3)
 
         # Chosen log odds
         log_odds_chosen = pc - torch.log1p(-torch.exp(pc))
@@ -730,12 +736,24 @@ def compute_logprobs_and_sft(
     original_pad_side = processor.tokenizer.padding_side
     processor.tokenizer.padding_side = "right"
 
-    def _single_forward(completions):
+    enc_p_batched = processor(
+        text=prompts,
+        images=batch_imgs if has_any_image else None,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        add_special_tokens=False,
+    )
+    p_lens = [int(mask.sum().item()) for mask in enc_p_batched["attention_mask"]]
+    del enc_p_batched
+
+
+    def _single_forward(completions, is_chosen):
         # Dynamically fetch the model's correct EOS token (e.g., "<end_of_turn>" for Gemma)
         eos = processor.tokenizer.eos_token
-
-        # Append it cleanly without hardcoding string values
         formatted_texts = [p + c + eos for p, c in zip(prompts, completions)]
+
         enc = processor(
             text=formatted_texts,
             images=batch_imgs if has_any_image else None,
@@ -746,21 +764,7 @@ def compute_logprobs_and_sft(
             add_special_tokens=False,
         ).to(model.device)
 
-        # Compute prompt lengths once per completion set
-        p_lens, s_lens = [], []
-        for i, (p, img) in enumerate(zip(prompts, images_list)):
-            enc_p = processor(
-                text=p,
-                images=[img] if img is not None else None,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_len,
-                add_special_tokens=False,
-            )
-            p_lens.append(enc_p["input_ids"].shape[1])
-            s_lens.append(int(enc["attention_mask"][i].sum().item()))
-            # Free immediately — don't let these accumulate
-            del enc_p
+        s_lens = [int(mask.sum().item()) for mask in enc["attention_mask"]]
 
         ctx = torch.inference_mode() if no_grad else torch.enable_grad()
         with ctx, torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -769,43 +773,44 @@ def compute_logprobs_and_sft(
         # Shift once, then slice per-example to avoid holding full logits
         # We process token-by-token in the vocab dimension only for the
         # completion slice, so peak memory stays bounded.
-        shift_logits = outputs.logits[:, :-1].contiguous()
-        shift_labels = enc["input_ids"][:, 1:].contiguous()
+        shift_logits = outputs.logits[:, :-1]
+        shift_labels = enc["input_ids"][:, 1:]
         del outputs, enc  # free ASAP before per-example loop
 
         lp_list, sft_list = [], []
         for i, p_len in enumerate(p_lens):
             s_len = s_lens[i]
+            # Explicitly append float32 zeros if completion is empty
             if s_len <= p_len:
-                lp_list.append(torch.tensor(0.0, device=shift_logits.device))
-                if compute_sft:
-                    sft_list.append(torch.tensor(0.0, device=shift_logits.device))
+                lp_list.append(torch.tensor(0.0, device=shift_logits.device, dtype=torch.float32))
+                if compute_sft and is_chosen:
+                    sft_list.append(torch.tensor(0.0, device=shift_logits.device, dtype=torch.float32))
                 continue
 
-            # Only slice the completion window — avoids allocating float32
-            # cross-entropy over the full (padded) sequence length
-            ex_logits = shift_logits[i, p_len - 1 : s_len - 1]   # [T_comp, V]
-            ex_labels = shift_labels[i, p_len - 1 : s_len - 1]   # [T_comp]
+            # Only slice the completion window
+            ex_logits = shift_logits[i, p_len - 1: s_len - 1]  # [T_comp, V]
+            ex_labels = shift_labels[i, p_len - 1: s_len - 1]  # [T_comp]
 
-            ex_ce = F.cross_entropy(ex_logits, ex_labels, reduction="none")
+            # Explicitly cast ex_logits to float32 to prevent internal bfloat16 overflow
+            # during log-sum-exp over Gemma's massive 256,000 token vocabulary
+            ex_ce = F.cross_entropy(ex_logits.float(), ex_labels, reduction="none")
+
             mean_logprob = (-ex_ce).mean()
             lp_list.append(mean_logprob)
-            if compute_sft:
+            if compute_sft and is_chosen:
                 sft_list.append(ex_ce.mean())
-
-            del ex_logits, ex_labels, ex_ce
 
         del shift_logits, shift_labels
 
         if no_grad:
             lp_list = [lp.detach() for lp in lp_list]
 
-        sft_tensor = torch.stack(sft_list) if compute_sft else None
+        sft_tensor = torch.stack(sft_list) if (compute_sft and is_chosen) else None
         return lp_list, sft_tensor
 
     # ── Run chosen, then rejected sequentially ────────────────────────────
-    lp_chosen, sft_tensor = _single_forward(chosen_completions)
-    lp_rejected, _ = _single_forward(rejected_completions)
+    lp_chosen, sft_tensor = _single_forward(chosen_completions, is_chosen=True)
+    lp_rejected, _ = _single_forward(rejected_completions, is_chosen=False)
 
     processor.tokenizer.padding_side = original_pad_side
     return lp_chosen, lp_rejected, sft_tensor
@@ -930,7 +935,6 @@ def run_training_phase(
                 )
 
         del pol_lp_chosen, pol_lp_rejected, loss_orpo_pref, loss_sft, loss
-        release_vram(accelerator, f"sub-batch {sb_idx + 1} post-backward")
 
     accelerator.unwrap_model(model).gradient_checkpointing_disable()
     release_vram(accelerator, "end of training phase")
