@@ -46,8 +46,8 @@ class FrameworkConfig:
     max_seq_len: int = (2 * 1024) + 256
 
     # Semantic guardrail
-    semantic_model_name: str = "all-MiniLM-L6-v2"
-    min_cosine_similarity: float = 0.35
+    semantic_model_name: str = "intfloat/multilingual-e5-large"
+    min_cosine_similarity: float = 0.70  # e5-large requires a higher threshold (e.g., 0.70 - 0.85)
 
     # Judge criteria — drives the dynamic system prompt
     judge_criteria: list = field(default_factory=lambda: [
@@ -59,8 +59,8 @@ class FrameworkConfig:
     ])
 
     # Training
-    dpo_beta: float = 0.1
-    learning_rate: float = 5e-5
+    orpo_beta: float = 0.2
+    learning_rate: float = 2e-5
     num_epochs: int = 1
     inference_batch_size: int = 32  # large batch for generation
     max_judge_batch_size: int = 8  # max batch size for judging
@@ -74,8 +74,8 @@ class FrameworkConfig:
 
     # Generation
     max_new_tokens: int = 1540
-    temperature: float = 0.7
-    top_p: float = 0.9
+    temperature: float = 0.3
+    top_p: float = 0.95
 
     # WandB
     wandb_project: str = "gemma-online-training"
@@ -168,10 +168,6 @@ Structure your final JSON exactly like this inside markdown fences:
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
-def extract_layer_idx(name: str) -> Optional[int]:
-    match = re.search(r"layers\.(\d+)", name)
-    return int(match.group(1)) if match else None
-
 def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
     accelerator.print("[Init] Loading processor...")
     processor = AutoProcessor.from_pretrained(cfg.model_name)
@@ -204,28 +200,23 @@ def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
 
     # 3. Add the second adapter ("reference")
     model.add_adapter("reference", lora_config)
+    accelerator.print("[Init] Syncing reference adapter to initial policy weights...")
+    state_dict = model.state_dict()
+    for name, param in model.named_parameters():
+        if "reference" in name:
+            policy_name = name.replace("reference", "policy")
+            if policy_name in state_dict:
+                param.data.copy_(state_dict[policy_name].data)
 
     max_layer = 0
     model.layer_grad_scales = {}
 
-    def get_hook(layer_idx):
-        def hook(grad):
-            # Scale gradient dynamically based on the current batch's layer assignment
-            scale = model.layer_grad_scales.get(layer_idx, 1.0)
-            return grad * scale
-        return hook
-
-    # 4. Set requires_grad rules
+    # 3. Set requires_grad rules
     for name, param in model.named_parameters():
         if "reference" in name:
             param.requires_grad_(False)
         elif "policy" in name:
             param.requires_grad_(True)
-            idx = extract_layer_idx(name)
-            if idx is not None:
-                if idx > max_layer: max_layer = idx
-                # Register backward hook safely intercepting the gradient stream
-                param.register_hook(get_hook(idx))
         else:
             param.requires_grad_(False)
 
@@ -466,11 +457,19 @@ class SemanticGuardrail:
             keep.append(sim >= threshold and same_lang)
         return keep
 
-
-
 def aggregate_score(scores: dict, cfg: FrameworkConfig) -> float:
+    # 1. STRICT VETO: If any single criterion is <= 2, the entire answer fails.
+    for k in cfg.judge_criteria:
+        if scores.get(k, 3) <= 2:
+            return 0.1
+
+    # 2. EQUAL AGGREGATION: If it survives the veto, average all scores equally.
     vals = [scores.get(k, 3) for k in cfg.judge_criteria]
-    return (sum(vals) / len(vals) - 1) / 4.0
+    mean_score = sum(vals) / len(vals)
+
+    # Normalize from a 1-5 scale to a 0.0-1.0 scale
+    return (mean_score - 1) / 4.0
+
 # ---------------------------------------------------------------------------
 # Training example dataclass
 # ---------------------------------------------------------------------------
@@ -483,7 +482,6 @@ class TrainingExample:
     rejected_completion: str
     reward_weight: float
     sft_weight: float
-    layer_mask_type: str
     judge_prompt: str
     judge_response: str
 
@@ -656,25 +654,14 @@ def run_inference_phase(
         if chosen_grammar <= 2 and chosen_semantics <= 2:
             reward_weight = 0.0
         else:
-            reward_weight = min(1.0, score_delta)
+            reward_weight = 1.0 if score_delta > 0.1 else 0.5
 
         # 2. SFT Weight: STRICT grammar filter.
         # If the chosen answer has bad grammar (< 4), DO NOT do SFT on it.
-        if chosen_grammar >= 4:
+        if chosen_grammar >= 4 and chosen_semantics >= 4:
             sft_weight = min(1.0, score_delta)
         else:
             sft_weight = 0.0
-
-        # 3. Layer Targeting Profile
-        # Good semantics but bad grammar -> Focus on Higher Layers (Freeze Syntax/Lower layers)
-        if chosen_semantics >= 4 and chosen_grammar <= 3:
-            layer_mask_type = "high_only"
-        # Good grammar but bad semantics -> Focus on Lower Layers (Freeze Semantics)
-        elif chosen_grammar >= 4 and chosen_semantics <= 3:
-            layer_mask_type = "low_only"
-        else:
-            layer_mask_type = "all"
-
         dpo_prompt = build_dpo_prompt(questions[orig_idx], processor)
 
         # We always populate the example (even if weights are 0.0) to prevent Distributed Deadlocks
@@ -686,7 +673,6 @@ def run_inference_phase(
             rejected_completion=rejected_completion,
             reward_weight=reward_weight,
             sft_weight=sft_weight,
-            layer_mask_type=layer_mask_type,
             judge_prompt=judge_prompt,
             judge_response = judge_response,
         )
@@ -694,19 +680,27 @@ def run_inference_phase(
     return output
 
 
-def dpo_loss_weighted_batch(
-        ref_lp_chosen: list[torch.Tensor],
-        ref_lp_rejected: list[torch.Tensor],
+def orpo_loss_weighted_batch(
         pol_lp_chosen: list[torch.Tensor],
         pol_lp_rejected: list[torch.Tensor],
-        beta: float, reward_weights: list[float],) -> torch.Tensor:
+        reward_weights: list[float],
+) -> torch.Tensor:
     losses = []
-    for rc, rr, pc, pr, w in zip(
-            ref_lp_chosen, ref_lp_rejected, pol_lp_chosen, pol_lp_rejected, reward_weights,
-    ):
-        margin = beta * ((pc - rc) - (pr - rr))
-        loss = -F.logsigmoid(margin)
-        losses.append(loss * w)  # FIX: Multiply LOSS by w, not the margin, for proper 0 gradients
+    for pc, pr, w in zip(pol_lp_chosen, pol_lp_rejected, reward_weights):
+        # ORPO requires average logprob per token (assuming pc and pr are means)
+        # Log Odds = log(P) - log(1 - P) -> implemented safely as log_P - log1p(-exp(log_P))
+
+        # Chosen log odds
+        log_odds_chosen = pc - torch.log1p(-torch.exp(pc))
+        # Rejected log odds
+        log_odds_rejected = pr - torch.log1p(-torch.exp(pr))
+
+        # Log Odds Ratio
+        log_odds_ratio = log_odds_chosen - log_odds_rejected
+
+        # ORPO preference loss
+        loss = -F.logsigmoid(log_odds_ratio)
+        losses.append(loss * w)
 
     return torch.stack(losses).mean() if losses else torch.tensor(0.0)
 
@@ -793,7 +787,8 @@ def compute_logprobs_and_sft(
             ex_labels = shift_labels[i, p_len - 1 : s_len - 1]   # [T_comp]
 
             ex_ce = F.cross_entropy(ex_logits, ex_labels, reduction="none")
-            lp_list.append((-ex_ce).sum())
+            mean_logprob = (-ex_ce).mean()
+            lp_list.append(mean_logprob)
             if compute_sft:
                 sft_list.append(ex_ce.mean())
 
@@ -837,35 +832,19 @@ def run_training_phase(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    accumulated_loss_dpo = 0.0
+    accumulated_loss_orpo = 0.0
     accumulated_loss_sft = 0.0
     accumulated_rw = 0.0
     accumulated_steps = 0
+
+    model.train()
+    accelerator.unwrap_model(model).set_adapter("policy")
 
     for sb_idx, sub_batch in enumerate(sub_batches):
         accelerator.print(
             f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {len(sub_batch)} examples"
         )
-
         unwrapped_model = accelerator.unwrap_model(model)
-
-        # ── Apply Majority Vote Layer Targeting for this sub-batch ──
-        mask_counts = {"all": 0, "high_only": 0, "low_only": 0}
-        for ex in sub_batch:
-            mask_counts[ex.layer_mask_type] += 1
-        dominant_mask = max(mask_counts, key=mask_counts.get)
-
-        mid_layer = getattr(unwrapped_model, "max_layer_idx", 41) // 2
-        max_layer = getattr(unwrapped_model, "max_layer_idx", 41)
-
-        # Mutates the hook configuration dict BEFORE the backward pass intercepts it
-        if dominant_mask == "high_only":
-            unwrapped_model.layer_grad_scales = {i: (0.0 if i <= mid_layer else 1.0) for i in range(max_layer + 1)}
-        elif dominant_mask == "low_only":
-            unwrapped_model.layer_grad_scales = {i: (1.0 if i <= mid_layer else 0.0) for i in range(max_layer + 1)}
-        else:
-            unwrapped_model.layer_grad_scales = {i: 1.0 for i in range(max_layer + 1)}
-
         dpo_prompts = [ex.dpo_prompt for ex in sub_batch]
         chosen_completions = [ex.chosen_completion for ex in sub_batch]
         rejected_completions = [ex.rejected_completion for ex in sub_batch]
@@ -873,24 +852,7 @@ def run_training_phase(
         sft_weights = [ex.sft_weight for ex in sub_batch]
         images_list = [ex.question_image for ex in sub_batch]
 
-        # ── 1. Reference log-probs — no grad ─────────────────────────────
-        model.eval()
-        unwrapped_model.set_adapter("reference")
-
-        with torch.no_grad():
-            ref_lp_chosen, ref_lp_rejected, _ = compute_logprobs_and_sft(
-                model, processor,
-                dpo_prompts, chosen_completions, rejected_completions,
-                images_list, cfg.max_seq_len,
-                compute_sft=False, no_grad=True,
-            )
-
-        release_vram(accelerator, f"sub-batch {sb_idx + 1} ref logprobs")
-
-        # ── 2. Policy log-probs + SFT — with grad ────────────────────────
-        model.train()
-        unwrapped_model.set_adapter("policy")
-
+        # ── 1. Policy log-probs + SFT (NO REFERENCE PASS NEEDED!) ────────
         with accelerator.accumulate(model):
             pol_lp_chosen, pol_lp_rejected, sft_losses_per_ex = (
                 compute_logprobs_and_sft(
@@ -901,19 +863,21 @@ def run_training_phase(
                 )
             )
 
-            loss_dpo = dpo_loss_weighted_batch(
-                ref_lp_chosen, ref_lp_rejected, pol_lp_chosen, pol_lp_rejected, cfg.dpo_beta, reward_weights
+            # Calculate ORPO Preference Loss (lambda is often 0.1)
+            loss_orpo_pref = orpo_loss_weighted_batch(
+                pol_lp_chosen, pol_lp_rejected, reward_weights
             )
 
+            # Calculate SFT Loss
             sft_w_tensor = torch.tensor(sft_weights, device=sft_losses_per_ex.device, dtype=sft_losses_per_ex.dtype)
             loss_sft = (sft_losses_per_ex * sft_w_tensor).mean()
 
-            loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
+            # Final ORPO combined loss (SFT is usually weighted higher in ORPO)
+            loss = loss_sft + (cfg.orpo_beta * loss_orpo_pref)
 
-            # The backward pass hook will automatically apply the layer 0.0 / 1.0 multiplier configured above!
             accelerator.backward(loss)
 
-            accumulated_loss_dpo += loss_dpo.item()
+            accumulated_loss_orpo += loss_orpo_pref.item()
             accumulated_loss_sft += loss_sft.item()
             accumulated_rw += sum(reward_weights) / len(reward_weights)
             accumulated_steps += 1
@@ -927,28 +891,28 @@ def run_training_phase(
         if accelerator.sync_gradients:
             global_step += 1
             scheduler.step()
-            avg_dpo = accumulated_loss_dpo / accumulated_steps
+            avg_orpo = accumulated_loss_orpo / accumulated_steps
             avg_sft = accumulated_loss_sft / accumulated_steps
-            avg_rw  = accumulated_rw       / accumulated_steps
+            avg_rw = accumulated_rw / accumulated_steps
 
             accelerator.log({
                 "train/loss_total": loss.item(),
-                "train/loss_dpo": avg_dpo,
+                "train/loss_orpo_pref": avg_orpo,
                 "train/loss_sft": avg_sft,
                 "train/reward_weight": avg_rw,
                 "train/learning_rate": scheduler.get_last_lr()[0],
                 "train/global_step": global_step,
             }, step=global_step)
 
+            accumulated_loss_orpo = 0.0
+            accumulated_loss_sft = 0.0
+            accumulated_rw = 0.0
+            accumulated_steps = 0
+
             accelerator.print(
                 f"  Step {global_step:4d} | loss={loss.item():.4f} | LR={scheduler.get_last_lr()[0]:.8f}"
-                f"| dpo={avg_dpo:.4f} | sft={avg_sft:.4f} | rw={avg_rw:.4f}"
+                f"| orpo={avg_orpo:.4f} | sft={avg_sft:.4f} | rw={avg_rw:.4f}"
             )
-
-            accumulated_loss_dpo = 0.0
-            accumulated_loss_sft = 0.0
-            accumulated_rw       = 0.0
-            accumulated_steps    = 0
 
             # ── Online ref sync ──────────────────────────────────────────
             if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
@@ -964,9 +928,7 @@ def run_training_phase(
                     f"[Ref] Synced policy → reference at step {global_step}."
                 )
 
-        del ref_lp_chosen, ref_lp_rejected
-        del pol_lp_chosen, pol_lp_rejected
-        del loss_dpo, loss
+        del pol_lp_chosen, pol_lp_rejected, loss_orpo_pref, loss_sft, loss
         release_vram(accelerator, f"sub-batch {sb_idx + 1} post-backward")
 
     accelerator.unwrap_model(model).gradient_checkpointing_disable()
