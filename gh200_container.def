@@ -1,0 +1,61 @@
+Bootstrap: docker
+# Use an NVIDIA NGC container optimized for ARM64/Grace CPU.
+# (Check your new cluster's docs for the recommended nvcr.io tag, typically 24.xx, 25.xx, or 26.xx)
+From: nvcr.io/nvidia/pytorch:26.01-py3
+
+%post
+    export PATH=/usr/local/bin:$PATH
+    export https_proxy=http://www-proxy.ijs.si:8080
+    export http_proxy=http://www-proxy.ijs.si:8080
+    export no_proxy=127.0.0.0/8
+
+    # NGC containers might not have EXTERNALLY-MANAGED, but safe to keep
+    rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
+    python3 -m pip install --upgrade pip setuptools wheel ninja
+    python3 -m pip install "numpy==2.2.6"
+
+    # 1. Install vllm. Note: If an ARM64 wheel is not available on PyPI, pip will
+    # build it from source automatically (this may take 10-15 minutes).
+    python3 -m pip install "vllm==0.19.0"
+
+    # 2. Pin transformers
+    python3 -m pip install "transformers==4.57.6"
+
+    # 3. Flash Attention: Removed the x86_64 wheel!
+    # Building from source is required on ARM64 if you explicitly need the flash_attn package.
+    # Make sure 'ninja' is installed (added above) to prevent OOM/slow build.
+    python3 -m pip install flash-attn --no-build-isolation
+
+    # 4. Rest of the training stack
+    python3 -m pip install \
+        wandb \
+        peft \
+        evaluate \
+        datasets \
+        tokenizers \
+        pandas \
+        nltk \
+        sentencepiece \
+        sentence_transformers \
+        huggingface-hub \
+        deepspeed \
+        ujson \
+        Pillow \
+        accelerate \
+        langdetect \
+        openai
+
+%environment
+    export PATH=/usr/local/bin:$PATH
+    # Again, update proxies if the new server is in a different network
+    export https_proxy=http://www-proxy.ijs.si:8080
+    export http_proxy=http://www-proxy.ijs.si:8080
+    export no_proxy=127.0.0.0/8
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    export WANDB_API_KEY=0371b79d28c3adb07413603f8d52a735ca4568f3
+    export WANDB_ENTITY=matejm
+    export WANDB_PROJECT=gemma-online-training
+
+%runscript
+    echo "Container ready."
+    wandb login

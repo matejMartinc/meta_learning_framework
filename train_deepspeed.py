@@ -59,7 +59,7 @@ class FrameworkConfig:
     ])
 
     # Training
-    dpo_beta: float = 0.2
+    orpo_beta: float = 0.2
     learning_rate: float = 2e-5
     num_epochs: int = 1
     inference_batch_size: int = 32  # large batch for generation
@@ -200,6 +200,13 @@ def load_models_and_processor(cfg: FrameworkConfig, accelerator: Accelerator):
 
     # 3. Add the second adapter ("reference")
     model.add_adapter("reference", lora_config)
+    accelerator.print("[Init] Syncing reference adapter to initial policy weights...")
+    state_dict = model.state_dict()
+    for name, param in model.named_parameters():
+        if "reference" in name:
+            policy_name = name.replace("reference", "policy")
+            if policy_name in state_dict:
+                param.data.copy_(state_dict[policy_name].data)
 
     max_layer = 0
     model.layer_grad_scales = {}
@@ -673,19 +680,34 @@ def run_inference_phase(
     return output
 
 
-def dpo_loss_weighted_batch(
-        ref_lp_chosen: list[torch.Tensor],
-        ref_lp_rejected: list[torch.Tensor],
+def orpo_loss_weighted_batch(
         pol_lp_chosen: list[torch.Tensor],
         pol_lp_rejected: list[torch.Tensor],
-        beta: float, reward_weights: list[float],) -> torch.Tensor:
+        reward_weights: list[float],
+) -> torch.Tensor:
     losses = []
-    for rc, rr, pc, pr, w in zip(
-            ref_lp_chosen, ref_lp_rejected, pol_lp_chosen, pol_lp_rejected, reward_weights,
-    ):
-        margin = beta * ((pc - rc) - (pr - rr))
-        loss = -F.logsigmoid(margin)
-        losses.append(loss * w)  # FIX: Multiply LOSS by w, not the margin, for proper 0 gradients
+    for pc, pr, w in zip(pol_lp_chosen, pol_lp_rejected, reward_weights):
+        # 1. Cast to float32 to prevent bfloat16 underflow/overflow.
+        # In bfloat16, exp(-1e-5) rounds to exactly 1.0, causing log1p to return -inf.
+        pc = pc.float()
+        pr = pr.float()
+
+        # 2. Clamp to -1e-3 to prevent the derivative from exploding.
+        # At -1e-5, the gradient multiplier is 10^5, which causes weights to explode.
+        pc = torch.clamp(pc, max=-1e-3)
+        pr = torch.clamp(pr, max=-1e-3)
+
+        # Chosen log odds
+        log_odds_chosen = pc - torch.log1p(-torch.exp(pc))
+        # Rejected log odds
+        log_odds_rejected = pr - torch.log1p(-torch.exp(pr))
+
+        # Log Odds Ratio
+        log_odds_ratio = log_odds_chosen - log_odds_rejected
+
+        # ORPO preference loss
+        loss = -F.logsigmoid(log_odds_ratio)
+        losses.append(loss * w)
 
     return torch.stack(losses).mean() if losses else torch.tensor(0.0)
 
@@ -714,12 +736,24 @@ def compute_logprobs_and_sft(
     original_pad_side = processor.tokenizer.padding_side
     processor.tokenizer.padding_side = "right"
 
-    def _single_forward(completions):
+    enc_p_batched = processor(
+        text=prompts,
+        images=batch_imgs if has_any_image else None,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        add_special_tokens=False,
+    )
+    p_lens = [int(mask.sum().item()) for mask in enc_p_batched["attention_mask"]]
+    del enc_p_batched
+
+
+    def _single_forward(completions, is_chosen):
         # Dynamically fetch the model's correct EOS token (e.g., "<end_of_turn>" for Gemma)
         eos = processor.tokenizer.eos_token
-
-        # Append it cleanly without hardcoding string values
         formatted_texts = [p + c + eos for p, c in zip(prompts, completions)]
+
         enc = processor(
             text=formatted_texts,
             images=batch_imgs if has_any_image else None,
@@ -730,21 +764,7 @@ def compute_logprobs_and_sft(
             add_special_tokens=False,
         ).to(model.device)
 
-        # Compute prompt lengths once per completion set
-        p_lens, s_lens = [], []
-        for i, (p, img) in enumerate(zip(prompts, images_list)):
-            enc_p = processor(
-                text=p,
-                images=[img] if img is not None else None,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_len,
-                add_special_tokens=False,
-            )
-            p_lens.append(enc_p["input_ids"].shape[1])
-            s_lens.append(int(enc["attention_mask"][i].sum().item()))
-            # Free immediately — don't let these accumulate
-            del enc_p
+        s_lens = [int(mask.sum().item()) for mask in enc["attention_mask"]]
 
         ctx = torch.inference_mode() if no_grad else torch.enable_grad()
         with ctx, torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -753,42 +773,44 @@ def compute_logprobs_and_sft(
         # Shift once, then slice per-example to avoid holding full logits
         # We process token-by-token in the vocab dimension only for the
         # completion slice, so peak memory stays bounded.
-        shift_logits = outputs.logits[:, :-1].contiguous()
-        shift_labels = enc["input_ids"][:, 1:].contiguous()
+        shift_logits = outputs.logits[:, :-1]
+        shift_labels = enc["input_ids"][:, 1:]
         del outputs, enc  # free ASAP before per-example loop
 
         lp_list, sft_list = [], []
         for i, p_len in enumerate(p_lens):
             s_len = s_lens[i]
+            # Explicitly append float32 zeros if completion is empty
             if s_len <= p_len:
-                lp_list.append(torch.tensor(0.0, device=shift_logits.device))
-                if compute_sft:
-                    sft_list.append(torch.tensor(0.0, device=shift_logits.device))
+                lp_list.append(torch.tensor(0.0, device=shift_logits.device, dtype=torch.float32))
+                if compute_sft and is_chosen:
+                    sft_list.append(torch.tensor(0.0, device=shift_logits.device, dtype=torch.float32))
                 continue
 
-            # Only slice the completion window — avoids allocating float32
-            # cross-entropy over the full (padded) sequence length
-            ex_logits = shift_logits[i, p_len - 1 : s_len - 1]   # [T_comp, V]
-            ex_labels = shift_labels[i, p_len - 1 : s_len - 1]   # [T_comp]
+            # Only slice the completion window
+            ex_logits = shift_logits[i, p_len - 1: s_len - 1]  # [T_comp, V]
+            ex_labels = shift_labels[i, p_len - 1: s_len - 1]  # [T_comp]
 
-            ex_ce = F.cross_entropy(ex_logits, ex_labels, reduction="none")
-            lp_list.append((-ex_ce).sum())
-            if compute_sft:
+            # Explicitly cast ex_logits to float32 to prevent internal bfloat16 overflow
+            # during log-sum-exp over Gemma's massive 256,000 token vocabulary
+            ex_ce = F.cross_entropy(ex_logits.float(), ex_labels, reduction="none")
+
+            mean_logprob = (-ex_ce).mean()
+            lp_list.append(mean_logprob)
+            if compute_sft and is_chosen:
                 sft_list.append(ex_ce.mean())
-
-            del ex_logits, ex_labels, ex_ce
 
         del shift_logits, shift_labels
 
         if no_grad:
             lp_list = [lp.detach() for lp in lp_list]
 
-        sft_tensor = torch.stack(sft_list) if compute_sft else None
+        sft_tensor = torch.stack(sft_list) if (compute_sft and is_chosen) else None
         return lp_list, sft_tensor
 
     # ── Run chosen, then rejected sequentially ────────────────────────────
-    lp_chosen, sft_tensor = _single_forward(chosen_completions)
-    lp_rejected, _ = _single_forward(rejected_completions)
+    lp_chosen, sft_tensor = _single_forward(chosen_completions, is_chosen=True)
+    lp_rejected, _ = _single_forward(rejected_completions, is_chosen=False)
 
     processor.tokenizer.padding_side = original_pad_side
     return lp_chosen, lp_rejected, sft_tensor
@@ -816,16 +838,18 @@ def run_training_phase(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    accumulated_loss_dpo = 0.0
+    accumulated_loss_orpo = 0.0
     accumulated_loss_sft = 0.0
     accumulated_rw = 0.0
     accumulated_steps = 0
+
+    model.train()
+    accelerator.unwrap_model(model).set_adapter("policy")
 
     for sb_idx, sub_batch in enumerate(sub_batches):
         accelerator.print(
             f"  [Train sub-batch {sb_idx + 1}/{len(sub_batches)}] {len(sub_batch)} examples"
         )
-
         unwrapped_model = accelerator.unwrap_model(model)
         dpo_prompts = [ex.dpo_prompt for ex in sub_batch]
         chosen_completions = [ex.chosen_completion for ex in sub_batch]
@@ -834,24 +858,7 @@ def run_training_phase(
         sft_weights = [ex.sft_weight for ex in sub_batch]
         images_list = [ex.question_image for ex in sub_batch]
 
-        # ── 1. Reference log-probs — no grad ─────────────────────────────
-        model.eval()
-        unwrapped_model.set_adapter("reference")
-
-        with torch.no_grad():
-            ref_lp_chosen, ref_lp_rejected, _ = compute_logprobs_and_sft(
-                model, processor,
-                dpo_prompts, chosen_completions, rejected_completions,
-                images_list, cfg.max_seq_len,
-                compute_sft=False, no_grad=True,
-            )
-
-        release_vram(accelerator, f"sub-batch {sb_idx + 1} ref logprobs")
-
-        # ── 2. Policy log-probs + SFT — with grad ────────────────────────
-        model.train()
-        unwrapped_model.set_adapter("policy")
-
+        # ── 1. Policy log-probs + SFT (NO REFERENCE PASS NEEDED!) ────────
         with accelerator.accumulate(model):
             pol_lp_chosen, pol_lp_rejected, sft_losses_per_ex = (
                 compute_logprobs_and_sft(
@@ -862,19 +869,21 @@ def run_training_phase(
                 )
             )
 
-            loss_dpo = dpo_loss_weighted_batch(
-                ref_lp_chosen, ref_lp_rejected, pol_lp_chosen, pol_lp_rejected, cfg.dpo_beta, reward_weights
+            # Calculate ORPO Preference Loss (lambda is often 0.1)
+            loss_orpo_pref = orpo_loss_weighted_batch(
+                pol_lp_chosen, pol_lp_rejected, reward_weights
             )
 
+            # Calculate SFT Loss
             sft_w_tensor = torch.tensor(sft_weights, device=sft_losses_per_ex.device, dtype=sft_losses_per_ex.dtype)
             loss_sft = (sft_losses_per_ex * sft_w_tensor).mean()
 
-            loss = (1 - cfg.sft_loss_weight) * loss_dpo + cfg.sft_loss_weight * loss_sft
+            # Final ORPO combined loss (SFT is usually weighted higher in ORPO)
+            loss = loss_sft + (cfg.orpo_beta * loss_orpo_pref)
 
-            # The backward pass hook will automatically apply the layer 0.0 / 1.0 multiplier configured above!
             accelerator.backward(loss)
 
-            accumulated_loss_dpo += loss_dpo.item()
+            accumulated_loss_orpo += loss_orpo_pref.item()
             accumulated_loss_sft += loss_sft.item()
             accumulated_rw += sum(reward_weights) / len(reward_weights)
             accumulated_steps += 1
@@ -888,28 +897,28 @@ def run_training_phase(
         if accelerator.sync_gradients:
             global_step += 1
             scheduler.step()
-            avg_dpo = accumulated_loss_dpo / accumulated_steps
+            avg_orpo = accumulated_loss_orpo / accumulated_steps
             avg_sft = accumulated_loss_sft / accumulated_steps
-            avg_rw  = accumulated_rw       / accumulated_steps
+            avg_rw = accumulated_rw / accumulated_steps
 
             accelerator.log({
                 "train/loss_total": loss.item(),
-                "train/loss_dpo": avg_dpo,
+                "train/loss_orpo_pref": avg_orpo,
                 "train/loss_sft": avg_sft,
                 "train/reward_weight": avg_rw,
                 "train/learning_rate": scheduler.get_last_lr()[0],
                 "train/global_step": global_step,
             }, step=global_step)
 
+            accumulated_loss_orpo = 0.0
+            accumulated_loss_sft = 0.0
+            accumulated_rw = 0.0
+            accumulated_steps = 0
+
             accelerator.print(
                 f"  Step {global_step:4d} | loss={loss.item():.4f} | LR={scheduler.get_last_lr()[0]:.8f}"
-                f"| dpo={avg_dpo:.4f} | sft={avg_sft:.4f} | rw={avg_rw:.4f}"
+                f"| orpo={avg_orpo:.4f} | sft={avg_sft:.4f} | rw={avg_rw:.4f}"
             )
-
-            accumulated_loss_dpo = 0.0
-            accumulated_loss_sft = 0.0
-            accumulated_rw       = 0.0
-            accumulated_steps    = 0
 
             # ── Online ref sync ──────────────────────────────────────────
             if cfg.ref_update_interval > 0 and global_step % cfg.ref_update_interval == 0:
@@ -925,10 +934,7 @@ def run_training_phase(
                     f"[Ref] Synced policy → reference at step {global_step}."
                 )
 
-        del ref_lp_chosen, ref_lp_rejected
-        del pol_lp_chosen, pol_lp_rejected
-        del loss_dpo, loss
-        release_vram(accelerator, f"sub-batch {sb_idx + 1} post-backward")
+        del pol_lp_chosen, pol_lp_rejected, loss_orpo_pref, loss_sft, loss
 
     accelerator.unwrap_model(model).gradient_checkpointing_disable()
     release_vram(accelerator, "end of training phase")
