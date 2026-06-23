@@ -16,7 +16,7 @@ mkdir -p checkpoints_sft
 
 # 2. Set Hugging Face environment variables
 # IMPORTANT: Put your actual Hugging Face token here if Gemma 3 is a gated model
-export HF_TOKEN="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"
+export HF_TOKEN=""
 
 # Set cache dir so you don't re-download the 12B model every job run.
 # (Change this path if you have a specific shared scratch space)
