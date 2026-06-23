@@ -41,7 +41,7 @@ class FrameworkConfig:
     num_epochs: int = 1
     batch_size: int = 2
     grad_accumulation_steps: int = 4
-    warmup_steps: int = 50
+    warmup_steps: int = 200
     output_dir: str = "./checkpoints_sft"
 
 
@@ -87,6 +87,10 @@ def load_model_and_tokenizer(cfg: FrameworkConfig):
         model = prepare_model_for_kbit_training(model)
 
     model.gradient_checkpointing_enable()
+
+    # [CRITICAL FIX]: Required if load_in_4bit is False, otherwise LoRA + Grad Checkpointing fails
+    if not cfg.load_in_4bit and hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     lora_config = _build_lora_config(cfg)
     model = get_peft_model(model, lora_config, adapter_name="default")
@@ -139,13 +143,13 @@ class SFTDataset(Dataset):
             add_generation_prompt=True
         )
 
-        prompt_len = len(user_tokens)
+        # [CRITICAL FIX]: Safeguard against index out of bounds in case 'full_tokens' was truncated
         labels = list(full_tokens)
+        prompt_len = min(len(user_tokens), len(labels))
 
         # Mask prompt tokens by setting them to -100
-        for i in range(len(labels)):
-            if i < prompt_len:
-                labels[i] = -100
+        for i in range(prompt_len):
+            labels[i] = -100
 
         return {
             "input_ids": torch.tensor(full_tokens, dtype=torch.long),
@@ -212,6 +216,9 @@ def train_sft(model, tokenizer, train_data, cfg: FrameworkConfig):
 
             step_loss += loss.item()
 
+            del outputs
+            del loss
+
             if (step + 1) % cfg.grad_accumulation_steps == 0:
                 # Gradient clipping is often helpful for SFT
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -253,7 +260,7 @@ if __name__ == "__main__":
         data_path="data/train_gams_nemotron.jsonl",
         num_epochs=1,
         load_in_4bit=False,
-        batch_size=1,
+        batch_size=8,
         grad_accumulation_steps=2,
         output_dir="./checkpoints_sft"
     )
