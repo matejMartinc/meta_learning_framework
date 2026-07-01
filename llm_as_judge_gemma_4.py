@@ -11,11 +11,11 @@ from transformers import AutoTokenizer
 # --- Configuration ---
 MODEL_RESULT_FILES = [
     "results/gemma-3-12b-it_epoch_1_debugged_meta_learning_predictions.jsonl",
-    "results/gemma-3-12b-it_sft_predictions.jsonl",
+    "results/gemma-3-12b-it_epoch_1_sft_predictions.jsonl",
     "results/gemma-3-12b-it_base_predictions.jsonl"
 ]
 
-OUTPUT_FILE = "LLM_as_a_judge_scores_gemma_4_judge.jsonl"
+OUTPUT_FILE = "LLM_as_a_judge_scores_gemma_4_judge_july_1st_3_models.jsonl"
 
 # Hugging Face Model ID
 JUDGE_MODEL_ID = "google/gemma-4-31B-it"

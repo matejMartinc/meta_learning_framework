@@ -70,11 +70,11 @@ class FrameworkConfig:
     sft_loss_weight: float = 0.4
     output_dir: str = "./checkpoints"
 
-    ref_update_interval: int = 200
+    ref_update_interval: int = 400
 
     # Generation
-    max_new_tokens: int = 1540
-    temperature: float = 0.3
+    max_new_tokens: int = 1024
+    temperature: float = 0.7
     top_p: float = 0.95
 
     # WandB
@@ -1104,7 +1104,7 @@ if __name__ == "__main__":
         max_judge_batch_size=48,  # judge batch at a time
         batch_size=8,  # train 8 at a time (per-GPU)
         output_dir="./checkpoints_meta_learning",
-        ref_update_interval=200,
+        ref_update_interval=500,
         wandb_project="gemma-online-dpo-sft"
     )
     main(cfg)

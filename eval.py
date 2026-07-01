@@ -122,5 +122,5 @@ def analyze_evaluations(file_path):
 
 
 if __name__ == "__main__":
-    file_name = "LLM_as_a_judge_scores_gemma_4_judge.jsonl"
+    file_name = "LLM_as_a_judge_scores_gemma_4_judge_july_1st_3_models.jsonl"
     print(analyze_evaluations(file_name))
